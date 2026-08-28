@@ -1225,3 +1225,178 @@ def test_appsync_graphql_api_echoes_its_tags(appsync):
     got = appsync.get_graphql_api(apiId=api["apiId"])["graphqlApi"]
     assert got["tags"]["team"] == "platform"
     assert got["tags"]["ourco:env"] == "ministack"
+
+
+def _cache_api(appsync, name):
+    return appsync.create_graphql_api(name=name, authenticationType="API_KEY")[
+        "graphqlApi"
+    ]["apiId"]
+
+
+def test_appsync_api_cache_lifecycle(appsync):
+    """CreateApiCache / Get / Update / Flush / Delete.
+
+    aws_appsync_api_cache cannot be applied at all without these, so an
+    environment that enables caching in the cloud has to disable it locally and
+    silently diverges from the thing it is meant to reproduce.
+    """
+    api_id = _cache_api(appsync, "qa-cache-lifecycle")
+
+    created = appsync.create_api_cache(
+        apiId=api_id,
+        ttl=60,
+        apiCachingBehavior="PER_RESOLVER_CACHING",
+        type="SMALL",
+        atRestEncryptionEnabled=True,
+        transitEncryptionEnabled=True,
+    )["apiCache"]
+    assert created["ttl"] == 60
+    assert created["apiCachingBehavior"] == "PER_RESOLVER_CACHING"
+    assert created["type"] == "SMALL"
+    assert created["atRestEncryptionEnabled"] is True
+    assert created["transitEncryptionEnabled"] is True
+    assert created["status"] == "AVAILABLE"
+
+    got = appsync.get_api_cache(apiId=api_id)["apiCache"]
+    assert got == created
+
+    updated = appsync.update_api_cache(
+        apiId=api_id, ttl=300, apiCachingBehavior="FULL_REQUEST_CACHING", type="MEDIUM"
+    )["apiCache"]
+    assert updated["ttl"] == 300
+    assert updated["apiCachingBehavior"] == "FULL_REQUEST_CACHING"
+    assert updated["type"] == "MEDIUM"
+    # Encryption is set at create time and cannot be changed by an update; it
+    # must survive one rather than silently reverting to false.
+    assert updated["atRestEncryptionEnabled"] is True
+    assert updated["transitEncryptionEnabled"] is True
+
+    appsync.flush_api_cache(apiId=api_id)
+    assert appsync.get_api_cache(apiId=api_id)["apiCache"]["ttl"] == 300
+
+    appsync.delete_api_cache(apiId=api_id)
+    with pytest.raises(ClientError) as e:
+        appsync.get_api_cache(apiId=api_id)
+    assert e.value.response["Error"]["Code"] == "NotFoundException"
+
+
+def test_appsync_api_cache_rejects_a_second_cache_and_unknown_apis(appsync):
+    """One cache per API, and the operations 404 on an API that does not exist."""
+    api_id = _cache_api(appsync, "qa-cache-errors")
+    appsync.create_api_cache(
+        apiId=api_id, ttl=60, apiCachingBehavior="PER_RESOLVER_CACHING", type="SMALL"
+    )
+
+    with pytest.raises(ClientError) as e:
+        appsync.create_api_cache(
+            apiId=api_id, ttl=60, apiCachingBehavior="PER_RESOLVER_CACHING", type="SMALL"
+        )
+    assert e.value.response["Error"]["Code"] == "BadRequestException"
+
+    for call in (
+        lambda: appsync.get_api_cache(apiId="doesnotexist"),
+        lambda: appsync.delete_api_cache(apiId="doesnotexist"),
+        lambda: appsync.flush_api_cache(apiId="doesnotexist"),
+    ):
+        with pytest.raises(ClientError) as e:
+            call()
+        assert e.value.response["Error"]["Code"] == "NotFoundException"
+
+
+def test_appsync_deleting_an_api_releases_its_cache(appsync):
+    """A cache must not outlive its API — a later API reusing the id would
+    otherwise inherit a cache nobody created."""
+    api_id = _cache_api(appsync, "qa-cache-cascade")
+    appsync.create_api_cache(
+        apiId=api_id, ttl=60, apiCachingBehavior="PER_RESOLVER_CACHING", type="SMALL"
+    )
+    appsync.delete_graphql_api(apiId=api_id)
+
+    with pytest.raises(ClientError) as e:
+        appsync.get_api_cache(apiId=api_id)
+    assert e.value.response["Error"]["Code"] == "NotFoundException"
+
+
+def _graphql(api_id, api_key, query):
+    """POST a query to the API's data plane the way an SDK would."""
+    import requests as _rq
+    r = _rq.post(f"{_ENDPOINT}/v1/apis/{api_id}/graphql",
+                 headers={"x-api-key": api_key, "content-type": "application/json"},
+                 json={"query": query}, timeout=15)
+    return r.json()
+
+def _cache_ds_api(appsync, ddb, name):
+    """An API with a DynamoDB-backed resolver, which is what ministack executes."""
+    api = appsync.create_graphql_api(name=name, authenticationType="API_KEY")["graphqlApi"]
+    api_id = api["apiId"]
+    key = appsync.create_api_key(apiId=api_id)["apiKey"]["id"]
+    table = f"{name}-table"
+    ddb.create_table(
+        TableName=table,
+        KeySchema=[{"AttributeName": "id", "KeyType": "HASH"}],
+        AttributeDefinitions=[{"AttributeName": "id", "AttributeType": "S"}],
+        BillingMode="PAY_PER_REQUEST",
+    )
+    appsync.create_data_source(
+        apiId=api_id, name="Things", type="AMAZON_DYNAMODB",
+        dynamodbConfig={"tableName": table, "awsRegion": "us-east-1"},
+    )
+    return api_id, key, table
+
+
+def test_appsync_caches_a_resolver_that_declares_a_ttl(appsync, ddb):
+    """A cached resolver must not re-read its datasource within the TTL.
+
+    An API can declare an ApiCache and per-resolver cachingConfig, and both
+    round-trip through the control plane, but the data plane ignored them: every
+    query re-ran the resolver. A caching bug — a stale read, a key collision —
+    could not be reproduced locally at all.
+    """
+    api_id, key, table = _cache_ds_api(appsync, ddb, "qa-cache-exec")
+    appsync.create_resolver(
+        apiId=api_id, typeName="Query", fieldName="getThing", dataSourceName="Things",
+        cachingConfig={"ttl": 300, "cachingKeys": ["$context.arguments.id"]},
+    )
+    appsync.create_api_cache(
+        apiId=api_id, ttl=60, apiCachingBehavior="PER_RESOLVER_CACHING", type="SMALL")
+
+    ddb.put_item(TableName=table, Item={"id": {"S": "t1"}, "v": {"S": "first"}})
+    q = '{ getThing(id: "t1") { id v } }'
+    first = _graphql(api_id, key, q)
+    assert first["data"]["getThing"]["v"] == "first"
+
+    # Change the row underneath. A cached resolver must still answer "first".
+    ddb.put_item(TableName=table, Item={"id": {"S": "t1"}, "v": {"S": "second"}})
+    cached = _graphql(api_id, key, q)
+    assert cached["data"]["getThing"]["v"] == "first", "resolver was not cached"
+
+    # A different argument is a different entry and must see the new value.
+    ddb.put_item(TableName=table, Item={"id": {"S": "t2"}, "v": {"S": "other"}})
+    other = _graphql(api_id, key, '{ getThing(id: "t2") { id v } }')
+    assert other["data"]["getThing"]["v"] == "other", "caching keys must isolate entries"
+
+    # FlushApiCache drops it, so the next read sees the new value.
+    appsync.flush_api_cache(apiId=api_id)
+    assert _graphql(api_id, key, q)["data"]["getThing"]["v"] == "second"
+
+
+def test_appsync_does_not_cache_without_an_api_cache_or_a_ttl(appsync, ddb):
+    """No ApiCache means no caching, and under PER_RESOLVER_CACHING a resolver
+    that declares no ttl is not cached either — otherwise enabling the cache
+    would silently start serving stale data from resolvers that never asked."""
+    api_id, key, table = _cache_ds_api(appsync, ddb, "qa-cache-off")
+    appsync.create_resolver(
+        apiId=api_id, typeName="Query", fieldName="getThing", dataSourceName="Things")
+
+    ddb.put_item(TableName=table, Item={"id": {"S": "t1"}, "v": {"S": "first"}})
+    q = '{ getThing(id: "t1") { id v } }'
+    assert _graphql(api_id, key, q)["data"]["getThing"]["v"] == "first"
+    ddb.put_item(TableName=table, Item={"id": {"S": "t1"}, "v": {"S": "second"}})
+    # No cache on the API at all.
+    assert _graphql(api_id, key, q)["data"]["getThing"]["v"] == "second"
+
+    # Now add a cache, but the resolver still declares no ttl.
+    appsync.create_api_cache(
+        apiId=api_id, ttl=60, apiCachingBehavior="PER_RESOLVER_CACHING", type="SMALL")
+    ddb.put_item(TableName=table, Item={"id": {"S": "t1"}, "v": {"S": "third"}})
+    assert _graphql(api_id, key, q)["data"]["getThing"]["v"] == "third"

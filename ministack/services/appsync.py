@@ -53,6 +53,11 @@ _resolvers = AccountRegionScopedDict()       # apiId -> {typeName -> {fieldName 
 _types = AccountRegionScopedDict()           # apiId -> {typeName -> type record}
 _functions = AccountRegionScopedDict()       # apiId -> {functionId -> function record}
 _schemas = AccountRegionScopedDict()         # apiId -> {"definition": str, "status": str, "details": str}
+_caches = AccountRegionScopedDict()           # apiId -> ApiCache record
+# apiId -> {cache key -> (expires_at, value)}. Separate from _caches, which holds
+# the ApiCache configuration; this is the cached data itself. Not persisted: a
+# restart is a cold cache, as replacing the cache instance would be on AWS.
+_cache_entries: dict = {}
 _tags = AccountScopedDict()            # resource_arn -> {key: value}
 
 # ---------------------------------------------------------------------------
@@ -260,6 +265,8 @@ def _delete_graphql_api(api_id):
     _types.pop(api_id, None)
     _functions.pop(api_id, None)
     _schemas.pop(api_id, None)
+    _caches.pop(api_id, None)
+    _cache_entries.pop(api_id, None)
     _tags.pop(arn, None)
 
     return _json(200, {})
@@ -776,6 +783,82 @@ def _list_tags_for_resource(arn):
     return _json(200, {"tags": tags})
 
 
+def _cache_record(data, existing=None):
+    """Build an ApiCache from a create or update request.
+
+    atRestEncryptionEnabled and transitEncryptionEnabled are set at create time
+    and cannot be changed afterwards, so an update carries them forward from the
+    existing cache rather than defaulting them back to false.
+    """
+    base = existing or {}
+    return {
+        "ttl": int(data.get("ttl", base.get("ttl", 0))),
+        "apiCachingBehavior": data.get(
+            "apiCachingBehavior", base.get("apiCachingBehavior", "FULL_REQUEST_CACHING")
+        ),
+        "type": data.get("type", base.get("type", "SMALL")),
+        "transitEncryptionEnabled": bool(
+            base.get("transitEncryptionEnabled",
+                     data.get("transitEncryptionEnabled", False))
+        ),
+        "atRestEncryptionEnabled": bool(
+            base.get("atRestEncryptionEnabled",
+                     data.get("atRestEncryptionEnabled", False))
+        ),
+        # No cache is actually kept — AppSync's cache is not observable through
+        # the control plane, and emulating eviction would invent behaviour a
+        # caller cannot verify. The record exists so the resource can be
+        # created, read back and destroyed.
+        "status": "AVAILABLE",
+    }
+
+
+def _create_api_cache(api_id, data):
+    if api_id not in _apis:
+        return error_response_json("NotFoundException", f"GraphQL API {api_id} not found", 404)
+    if _caches.get(api_id) is not None:
+        return error_response_json(
+            "BadRequestException", f"Cache already exists for API {api_id}", 400)
+    record = _cache_record(data)
+    _caches[api_id] = record
+    return _json(200, {"apiCache": record})
+
+
+def _get_api_cache(api_id):
+    cache = _caches.get(api_id)
+    if cache is None:
+        return error_response_json(
+            "NotFoundException", f"Cache not found for API {api_id}", 404)
+    return _json(200, {"apiCache": cache})
+
+
+def _update_api_cache(api_id, data):
+    existing = _caches.get(api_id)
+    if existing is None:
+        return error_response_json(
+            "NotFoundException", f"Cache not found for API {api_id}", 404)
+    record = _cache_record(data, existing)
+    _caches[api_id] = record
+    return _json(200, {"apiCache": record})
+
+
+def _delete_api_cache(api_id):
+    if _caches.get(api_id) is None:
+        return error_response_json(
+            "NotFoundException", f"Cache not found for API {api_id}", 404)
+    _caches.pop(api_id, None)
+    _cache_entries.pop(api_id, None)
+    return _json(200, {})
+
+
+def _flush_api_cache(api_id):
+    if _caches.get(api_id) is None:
+        return error_response_json(
+            "NotFoundException", f"Cache not found for API {api_id}", 404)
+    _cache_entries.pop(api_id, None)
+    return _json(200, {})
+
+
 # ---------------------------------------------------------------------------
 # Request router
 # ---------------------------------------------------------------------------
@@ -867,6 +950,23 @@ async def handle_request(method, path, headers, body, query_params):
             return _delete_graphql_api(api_id)
 
     # /v1/apis/{apiId}/apikeys
+    # ApiCaches: /v1/apis/{apiId}/ApiCaches[/update], and the separate
+    # /FlushCache path. UpdateApiCache is a POST to .../ApiCaches/update, not a
+    # PUT on the collection, so it has to be matched before the bare form.
+    if sub1 == "ApiCaches":
+        if sub2 == "update" and method == "POST":
+            return _update_api_cache(api_id, data)
+        if sub2 is None:
+            if method == "POST":
+                return _create_api_cache(api_id, data)
+            if method == "GET":
+                return _get_api_cache(api_id)
+            if method == "DELETE":
+                return _delete_api_cache(api_id)
+
+    if sub1 == "FlushCache" and method == "DELETE":
+        return _flush_api_cache(api_id)
+
     if sub1 == "apikeys":
         # Real SDKs route AppSync API key operations through the v1 path even
         # for Event APIs. If the id is not a GraphQL API but is an Event API,
@@ -990,6 +1090,8 @@ def reset():
     _types.clear()
     _functions.clear()
     _schemas.clear()
+    _caches.clear()
+    _cache_entries.clear()
     _tags.clear()
 
 
@@ -1003,6 +1105,7 @@ def get_state():
         "types": _types,
         "functions": _functions,
         "schemas": _schemas,
+        "caches": _caches,
         "tags": _tags,
     })
 
@@ -1022,6 +1125,7 @@ def restore_state(data):
         (_types, "types"),
         (_functions, "functions"),
         (_schemas, "schemas"),
+        (_caches, "caches"),
     ):
         _restore_api_child_store(store, data.get(key, {}), api_regions)
     _tags.update(data.get("tags", {}))
@@ -1245,6 +1349,14 @@ def _execute_graphql(api_id, data, request_headers=None):
     for field_name, args, sub_fields in fields:
         resolver = _find_resolver(api_id, "Mutation" if is_mutation else "Query", field_name)
         if resolver:
+            # A mutation is never served from cache, and never populates it.
+            cache_hit = None if is_mutation else _cache_key_for(
+                api_id, resolver, field_name, args, identity, {})
+            if cache_hit:
+                cached = _cache_get(api_id, cache_hit[0])
+                if cached is not None:
+                    results[field_name] = cached
+                    continue
             try:
                 result = _resolve_field(
                     api_id, resolver, args, sub_fields, variables,
@@ -1254,6 +1366,10 @@ def _execute_graphql(api_id, data, request_headers=None):
                     source={},
                 )
                 results[field_name] = result
+                # Only a successful result is cached; caching an error would
+                # make a transient failure stick for the whole ttl.
+                if cache_hit and result is not None:
+                    _cache_put(api_id, cache_hit[0], cache_hit[1], result)
             except Exception as e:
                 errors.append({"message": str(e), "path": [field_name]})
                 results[field_name] = None
@@ -1307,6 +1423,61 @@ def _parse_args(args_str, variables):
             val = float(val) if "." in val else int(val)
         args[key] = val
     return args
+
+
+def _cache_key_for(api_id, resolver, field_name, args, identity, source):
+    """Build a cache key for this field call, or None when it must not be cached.
+
+    Mirrors AppSync: under PER_RESOLVER_CACHING only a resolver carrying a
+    cachingConfig ttl is cached; under FULL_REQUEST_CACHING every resolver is,
+    using the cache's own ttl. A caching key that cannot be resolved disables
+    caching for the call rather than collapsing to a shared entry — two callers
+    sharing an entry they should not is worse than not caching.
+    """
+    cache_cfg = _caches.get(api_id)
+    if not cache_cfg:
+        return None
+    behavior = cache_cfg.get("apiCachingBehavior", "FULL_REQUEST_CACHING")
+    resolver_cfg = (resolver or {}).get("cachingConfig") or {}
+
+    if behavior == "PER_RESOLVER_CACHING":
+        ttl = resolver_cfg.get("ttl")
+        if not ttl:
+            return None
+    else:
+        ttl = cache_cfg.get("ttl")
+        if not ttl:
+            return None
+
+    ctx = {"arguments": args or {}, "args": args or {},
+           "identity": identity or {}, "source": source or {}}
+    parts = []
+    for expr in resolver_cfg.get("cachingKeys") or []:
+        path = expr.split(".")
+        if path and path[0].lstrip("$") in ("context", "ctx"):
+            path = path[1:]
+        cur = ctx
+        for seg in path:
+            if not isinstance(cur, dict) or seg not in cur:
+                return None
+            cur = cur[seg]
+        parts.append(f"{expr}={json.dumps(cur, sort_keys=True, default=str)}")
+    return f"{field_name}|" + "&".join(parts), int(ttl)
+
+
+def _cache_get(api_id, key):
+    entry = _cache_entries.get(api_id, {}).get(key)
+    if not entry:
+        return None
+    expires_at, value = entry
+    if expires_at <= time.time():
+        _cache_entries.get(api_id, {}).pop(key, None)
+        return None
+    return copy.deepcopy(value)
+
+
+def _cache_put(api_id, key, ttl, value):
+    _cache_entries.setdefault(api_id, {})[key] = (time.time() + ttl, copy.deepcopy(value))
 
 
 def _find_resolver(api_id, type_name, field_name):
