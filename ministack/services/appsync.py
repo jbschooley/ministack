@@ -17,6 +17,7 @@ Wire protocol:
   Credential scope: appsync
 """
 
+import base64
 import copy
 import json
 import logging
@@ -50,6 +51,8 @@ _api_keys = AccountRegionScopedDict()        # apiId -> {keyId -> key record}
 _data_sources = AccountRegionScopedDict()    # apiId -> {name -> data source record}
 _resolvers = AccountRegionScopedDict()       # apiId -> {typeName -> {fieldName -> resolver record}}
 _types = AccountRegionScopedDict()           # apiId -> {typeName -> type record}
+_functions = AccountRegionScopedDict()       # apiId -> {functionId -> function record}
+_schemas = AccountRegionScopedDict()         # apiId -> {"definition": str, "status": str, "details": str}
 _tags = AccountScopedDict()            # resource_arn -> {key: value}
 
 # ---------------------------------------------------------------------------
@@ -167,6 +170,14 @@ def _create_graphql_api(body):
         },
         "additionalAuthenticationProviders": additional_auth,
         "xrayEnabled": xray,
+        # Fields with server-side defaults. Omitting them makes a Terraform plan
+        # see api_type and visibility as newly set, and both force replacement —
+        # so every plan wanted to recreate the API and all of its children.
+        "apiType": body.get("apiType", "GRAPHQL"),
+        "visibility": body.get("visibility", "GLOBAL"),
+        "introspectionConfig": body.get("introspectionConfig", "ENABLED"),
+        "queryDepthLimit": body.get("queryDepthLimit", 0),
+        "resolverCountLimit": body.get("resolverCountLimit", 0),
         "wafWebAclArn": body.get("wafWebAclArn"),
         "createdAt": now,
         "lastUpdatedAt": now,
@@ -240,6 +251,8 @@ def _delete_graphql_api(api_id):
     _data_sources.pop(api_id, None)
     _resolvers.pop(api_id, None)
     _types.pop(api_id, None)
+    _functions.pop(api_id, None)
+    _schemas.pop(api_id, None)
     _tags.pop(arn, None)
 
     return _json(200, {})
@@ -498,6 +511,233 @@ def _list_types(api_id, query_params):
 # Tags
 # ---------------------------------------------------------------------------
 
+# ---------------------------------------------------------------------------
+# Schema
+# ---------------------------------------------------------------------------
+
+def _start_schema_creation(api_id, body):
+    """StartSchemaCreation.
+
+    AWS accepts the SDL, validates and compiles it asynchronously, and the caller
+    polls GetSchemaCreationStatus until SUCCESS or FAILED. The definition arrives
+    base64-encoded because it is a blob member.
+
+    The SDL is stored verbatim rather than parsed: nothing here consumes a type
+    graph — resolvers are addressed by type and field name, and _execute_graphql
+    resolves fields against the registered resolvers — so parsing would add a
+    dependency and a new failure mode without changing any behaviour. Compilation
+    is therefore synchronous and always succeeds, and the status is reported the
+    way a completed creation reports it.
+    """
+    if api_id not in _apis:
+        return error_response_json("NotFoundException", f"GraphQL API {api_id} not found", 404)
+
+    definition = body.get("definition", "")
+    if not definition:
+        return error_response_json("BadRequestException", "definition is required", 400)
+
+    if isinstance(definition, str):
+        try:
+            definition = base64.b64decode(definition).decode("utf-8")
+        except Exception:
+            # Already-plain SDL: accept it rather than refusing a readable schema.
+            pass
+    elif isinstance(definition, (bytes, bytearray)):
+        definition = definition.decode("utf-8", "replace")
+
+    _schemas[api_id] = {
+        "definition": definition,
+        "status": "SUCCESS",
+        "details": "Schema creation successful.",
+    }
+    logger.info("AppSync: schema created for %s (%d bytes)", api_id, len(definition))
+    return _json(200, {"status": "PROCESSING"})
+
+
+def _get_schema_creation_status(api_id):
+    if api_id not in _apis:
+        return error_response_json("NotFoundException", f"GraphQL API {api_id} not found", 404)
+    schema = _schemas.get(api_id)
+    if not schema:
+        return _json(200, {"status": "NOT_APPLICABLE", "details": ""})
+    return _json(200, {"status": schema["status"], "details": schema["details"]})
+
+
+def _get_introspection_schema(api_id, query_params):
+    """GetIntrospectionSchema — the response body is the schema blob itself."""
+    if api_id not in _apis:
+        return error_response_json("NotFoundException", f"GraphQL API {api_id} not found", 404)
+    schema = _schemas.get(api_id)
+    if not schema:
+        return error_response_json("GraphQLSchemaException", "No schema found for this API", 404)
+
+    fmt = (query_params.get("format") or ["SDL"])
+    fmt = (fmt[0] if isinstance(fmt, list) else fmt or "SDL").upper()
+    if fmt not in ("SDL", "JSON"):
+        return error_response_json("BadRequestException", f"Unsupported format: {fmt}", 400)
+    if fmt == "JSON":
+        # A JSON introspection result requires a parsed type graph, which is
+        # deliberately not built here; SDL is what tooling against MiniStack uses.
+        return error_response_json(
+            "BadRequestException",
+            "JSON introspection is not supported by MiniStack; request format=SDL.", 400)
+
+    return 200, {"Content-Type": "application/octet-stream"}, schema["definition"].encode("utf-8")
+
+
+def _is_ok(response):
+    """True when a handler tuple carries a 2xx status."""
+    return isinstance(response, tuple) and 200 <= response[0] < 300
+
+
+def _update_data_source(api_id, name, body):
+    if api_id not in _apis:
+        return error_response_json("NotFoundException", f"GraphQL API {api_id} not found", 404)
+    if name not in _data_sources.get(api_id, {}):
+        return error_response_json("NotFoundException", f"Data source {name} not found", 404)
+    created_at = _data_sources[api_id][name].get("createdAt")
+    body = dict(body)
+    body["name"] = name
+    response = _create_data_source(api_id, body)
+    if not _is_ok(response):
+        return response
+    # AWS keeps the original creation time across an update, so restore it on the
+    # stored record and answer with that rather than the freshly stamped one.
+    record = _data_sources[api_id][name]
+    if created_at:
+        record["createdAt"] = created_at
+    return _json(200, {"dataSource": record})
+
+
+def _update_resolver(api_id, type_name, field_name, body):
+    if api_id not in _apis:
+        return error_response_json("NotFoundException", f"GraphQL API {api_id} not found", 404)
+    if field_name not in _resolvers.get(api_id, {}).get(type_name, {}):
+        return error_response_json(
+            "NotFoundException", f"Resolver {type_name}.{field_name} not found", 404)
+    created_at = _resolvers[api_id][type_name][field_name].get("createdAt")
+    body = dict(body)
+    body["fieldName"] = field_name
+    response = _create_resolver(api_id, type_name, body)
+    if not _is_ok(response):
+        return response
+    record = _resolvers[api_id][type_name][field_name]
+    if created_at:
+        record["createdAt"] = created_at
+    return _json(200, {"resolver": record})
+
+
+def _update_type(api_id, type_name, body):
+    if api_id not in _apis:
+        return error_response_json("NotFoundException", f"GraphQL API {api_id} not found", 404)
+    if type_name not in _types.get(api_id, {}):
+        return error_response_json("NotFoundException", f"Type {type_name} not found", 404)
+    body = dict(body)
+    body.setdefault("name", type_name)
+    return _create_type(api_id, body)
+
+
+def _update_api_key(api_id, key_id, body):
+    if api_id not in _apis:
+        return error_response_json("NotFoundException", f"GraphQL API {api_id} not found", 404)
+    key = _api_keys.get(api_id, {}).get(key_id)
+    if not key:
+        return error_response_json("NotFoundException", f"API key {key_id} not found", 404)
+    if body.get("description") is not None:
+        key["description"] = body["description"]
+    if body.get("expires") is not None:
+        key["expires"] = int(body["expires"])
+    return _json(200, {"apiKey": key})
+
+
+def _put_environment_variables(api_id, body):
+    """PutGraphqlApiEnvironmentVariables — replaces the whole map, as AWS does."""
+    if api_id not in _apis:
+        return error_response_json("NotFoundException", f"GraphQL API {api_id} not found", 404)
+    env = body.get("environmentVariables")
+    if env is None:
+        return error_response_json("BadRequestException", "environmentVariables is required", 400)
+    if not isinstance(env, dict):
+        return error_response_json("BadRequestException", "environmentVariables must be a map", 400)
+    _apis[api_id]["environmentVariables"] = env
+    return _json(200, {"environmentVariables": env})
+
+
+def _get_environment_variables(api_id):
+    if api_id not in _apis:
+        return error_response_json("NotFoundException", f"GraphQL API {api_id} not found", 404)
+    return _json(200, {"environmentVariables": _apis[api_id].get("environmentVariables", {})})
+
+
+# ---------------------------------------------------------------------------
+# Pipeline functions
+# ---------------------------------------------------------------------------
+
+def _function_record(api_id, function_id, body):
+    arn = f"{_apis[api_id]['arn']}/functions/{function_id}"
+    record = {
+        "functionId": function_id,
+        "functionArn": arn,
+        "name": body.get("name", ""),
+        "description": body.get("description", ""),
+        "dataSourceName": body.get("dataSourceName", ""),
+        "requestMappingTemplate": body.get("requestMappingTemplate", ""),
+        "responseMappingTemplate": body.get("responseMappingTemplate", ""),
+        "functionVersion": body.get("functionVersion", "2018-05-29"),
+    }
+    for optional in ("syncConfig", "maxBatchSize", "runtime", "code"):
+        if body.get(optional) is not None:
+            record[optional] = body[optional]
+    return record
+
+
+def _create_function(api_id, body):
+    if api_id not in _apis:
+        return error_response_json("NotFoundException", f"GraphQL API {api_id} not found", 404)
+
+    name = body.get("name")
+    if not name:
+        return error_response_json("BadRequestException", "name is required", 400)
+
+    function_id = new_uuid().replace("-", "")[:26]
+    record = _function_record(api_id, function_id, body)
+    _functions.setdefault(api_id, {})[function_id] = record
+    return _json(200, {"functionConfiguration": record})
+
+
+def _get_function(api_id, function_id):
+    if api_id not in _apis:
+        return error_response_json("NotFoundException", f"GraphQL API {api_id} not found", 404)
+    record = _functions.get(api_id, {}).get(function_id)
+    if not record:
+        return error_response_json("NotFoundException", f"Function {function_id} not found", 404)
+    return _json(200, {"functionConfiguration": record})
+
+
+def _list_functions(api_id):
+    if api_id not in _apis:
+        return error_response_json("NotFoundException", f"GraphQL API {api_id} not found", 404)
+    return _json(200, {"functions": list(_functions.get(api_id, {}).values())})
+
+
+def _update_function(api_id, function_id, body):
+    if api_id not in _apis:
+        return error_response_json("NotFoundException", f"GraphQL API {api_id} not found", 404)
+    if function_id not in _functions.get(api_id, {}):
+        return error_response_json("NotFoundException", f"Function {function_id} not found", 404)
+    record = _function_record(api_id, function_id, body)
+    _functions[api_id][function_id] = record
+    return _json(200, {"functionConfiguration": record})
+
+
+def _delete_function(api_id, function_id):
+    if api_id not in _apis:
+        return error_response_json("NotFoundException", f"GraphQL API {api_id} not found", 404)
+    if _functions.get(api_id, {}).pop(function_id, None) is None:
+        return error_response_json("NotFoundException", f"Function {function_id} not found", 404)
+    return _json(200, {})
+
+
 def _tag_resource(body):
     arn = body.get("resourceArn", "")
     tags = body.get("tags", {})
@@ -641,8 +881,44 @@ async def handle_request(method, path, headers, body, query_params):
                 return _list_api_keys(api_id)
         else:
             # /v1/apis/{apiId}/apikeys/{keyId}
-            if method == "DELETE":
+            if method == "POST":
+                return _update_api_key(api_id, sub2, data)
+            elif method == "DELETE":
                 return _delete_api_key(api_id, sub2)
+
+    # /v1/apis/{apiId}/environmentVariables
+    if sub1 == "environmentVariables" and sub2 is None:
+        if method == "PUT":
+            return _put_environment_variables(api_id, data)
+        elif method == "GET":
+            return _get_environment_variables(api_id)
+
+    # /v1/apis/{apiId}/schemacreation
+    if sub1 == "schemacreation" and sub2 is None:
+        if method == "POST":
+            return _start_schema_creation(api_id, data)
+        elif method == "GET":
+            return _get_schema_creation_status(api_id)
+
+    # /v1/apis/{apiId}/schema
+    if sub1 == "schema" and sub2 is None and method == "GET":
+        return _get_introspection_schema(api_id, query_params)
+
+    # /v1/apis/{apiId}/functions
+    if sub1 == "functions":
+        if sub2 is None:
+            if method == "POST":
+                return _create_function(api_id, data)
+            elif method == "GET":
+                return _list_functions(api_id)
+        else:
+            # /v1/apis/{apiId}/functions/{functionId}
+            if method == "GET":
+                return _get_function(api_id, sub2)
+            elif method == "POST":
+                return _update_function(api_id, sub2, data)
+            elif method == "DELETE":
+                return _delete_function(api_id, sub2)
 
     # /v1/apis/{apiId}/datasources
     if sub1 == "datasources":
@@ -655,6 +931,8 @@ async def handle_request(method, path, headers, body, query_params):
             # /v1/apis/{apiId}/datasources/{name}
             if method == "GET":
                 return _get_data_source(api_id, sub2)
+            elif method == "POST":
+                return _update_data_source(api_id, sub2, data)
             elif method == "DELETE":
                 return _delete_data_source(api_id, sub2)
 
@@ -678,12 +956,16 @@ async def handle_request(method, path, headers, body, query_params):
                 field_name = sub4
                 if method == "GET":
                     return _get_resolver(api_id, type_name, field_name)
+                elif method == "POST":
+                    return _update_resolver(api_id, type_name, field_name, data)
                 elif method == "DELETE":
                     return _delete_resolver(api_id, type_name, field_name)
         else:
-            # /v1/apis/{apiId}/types/{typeName} — GetType
+            # /v1/apis/{apiId}/types/{typeName}
             if sub3 is None and method == "GET":
                 return _get_type(api_id, sub2, query_params)
+            if sub3 is None and method == "POST":
+                return _update_type(api_id, sub2, data)
 
     return error_response_json("BadRequestException", f"Unsupported route: {method} {path}")
 
@@ -699,6 +981,8 @@ def reset():
     _data_sources.clear()
     _resolvers.clear()
     _types.clear()
+    _functions.clear()
+    _schemas.clear()
     _tags.clear()
 
 
@@ -710,6 +994,8 @@ def get_state():
         "data_sources": _data_sources,
         "resolvers": _resolvers,
         "types": _types,
+        "functions": _functions,
+        "schemas": _schemas,
         "tags": _tags,
     })
 
@@ -727,6 +1013,8 @@ def restore_state(data):
         (_data_sources, "data_sources"),
         (_resolvers, "resolvers"),
         (_types, "types"),
+        (_functions, "functions"),
+        (_schemas, "schemas"),
     ):
         _restore_api_child_store(store, data.get(key, {}), api_regions)
     _tags.update(data.get("tags", {}))

@@ -963,3 +963,234 @@ def test_appsync_lambda_failing_authorizer_returns_unauthorized(appsync, lam):
                                             _APPSYNC_IDENTITY_PROBE_RESOLVER)
     _appsync_expect_unauthorized(url, "{ testField { hasIdentity } }",
                                  headers={"Authorization": "Bearer fake-jwt"})
+
+
+SDL = """type Query {
+  hello: String
+}
+schema { query: Query }
+"""
+
+
+def test_appsync_schema_creation_and_introspection():
+    """StartSchemaCreation stores the SDL; the status polls to SUCCESS and it reads back."""
+    from conftest import make_client
+    appsync = make_client("appsync")
+    api = appsync.create_graphql_api(name="schema-api", authenticationType="API_KEY")["graphqlApi"]
+
+    started = appsync.start_schema_creation(apiId=api["apiId"], definition=SDL.encode())
+    assert started["status"] in ("PROCESSING", "SUCCESS")
+
+    status = appsync.get_schema_creation_status(apiId=api["apiId"])
+    assert status["status"] == "SUCCESS"
+
+    schema = appsync.get_introspection_schema(apiId=api["apiId"], format="SDL")
+    assert schema["schema"].read().decode() == SDL
+
+
+def test_appsync_schema_creation_status_without_a_schema():
+    """An API that has never had a schema reports NOT_APPLICABLE rather than failing."""
+    from conftest import make_client
+    appsync = make_client("appsync")
+    api = appsync.create_graphql_api(name="noschema-api", authenticationType="API_KEY")["graphqlApi"]
+    assert appsync.get_schema_creation_status(apiId=api["apiId"])["status"] == "NOT_APPLICABLE"
+
+
+def test_appsync_pipeline_function_crud():
+    """Create, get, list, update and delete a pipeline function."""
+    from conftest import make_client
+    appsync = make_client("appsync")
+    api = appsync.create_graphql_api(name="fn-api", authenticationType="API_KEY")["graphqlApi"]
+    appsync.create_data_source(apiId=api["apiId"], name="NoneDS", type="NONE")
+
+    created = appsync.create_function(
+        apiId=api["apiId"], name="fnOne", dataSourceName="NoneDS",
+        functionVersion="2018-05-29",
+        runtime={"name": "APPSYNC_JS", "runtimeVersion": "1.0.0"},
+        code="export function request(ctx){return {};} export function response(ctx){return ctx.result;}",
+    )["functionConfiguration"]
+    assert created["name"] == "fnOne"
+    assert created["functionId"]
+    assert created["functionArn"].endswith(f"/functions/{created['functionId']}")
+    assert created["runtime"]["name"] == "APPSYNC_JS"
+
+    got = appsync.get_function(apiId=api["apiId"], functionId=created["functionId"])
+    assert got["functionConfiguration"]["name"] == "fnOne"
+
+    listed = appsync.list_functions(apiId=api["apiId"])["functions"]
+    assert [f["functionId"] for f in listed] == [created["functionId"]]
+
+    updated = appsync.update_function(
+        apiId=api["apiId"], functionId=created["functionId"],
+        name="fnOneRenamed", dataSourceName="NoneDS", functionVersion="2018-05-29",
+    )["functionConfiguration"]
+    assert updated["name"] == "fnOneRenamed"
+    assert updated["functionId"] == created["functionId"]
+
+    appsync.delete_function(apiId=api["apiId"], functionId=created["functionId"])
+    assert appsync.list_functions(apiId=api["apiId"])["functions"] == []
+
+
+def test_appsync_pipeline_resolver_referencing_functions():
+    """A PIPELINE resolver keeps the function ids it was created with.
+
+    This is the shape Terraform produces: functions first, then a resolver whose
+    pipelineConfig lists their ids.
+    """
+    from conftest import make_client
+    appsync = make_client("appsync")
+    api = appsync.create_graphql_api(name="pipe-api", authenticationType="API_KEY")["graphqlApi"]
+    appsync.start_schema_creation(apiId=api["apiId"], definition=SDL.encode())
+    appsync.create_data_source(apiId=api["apiId"], name="NoneDS", type="NONE")
+
+    ids = [
+        appsync.create_function(
+            apiId=api["apiId"], name=f"step{i}", dataSourceName="NoneDS",
+            functionVersion="2018-05-29",
+        )["functionConfiguration"]["functionId"]
+        for i in range(2)
+    ]
+
+    resolver = appsync.create_resolver(
+        apiId=api["apiId"], typeName="Query", fieldName="hello",
+        kind="PIPELINE", pipelineConfig={"functions": ids},
+    )["resolver"]
+    assert resolver["kind"] == "PIPELINE"
+    assert resolver["pipelineConfig"]["functions"] == ids
+
+
+def test_appsync_graphql_api_environment_variables():
+    """Environment variables round-trip, and a put replaces the whole map."""
+    from conftest import make_client
+    appsync = make_client("appsync")
+    api = appsync.create_graphql_api(name="env-api", authenticationType="API_KEY")["graphqlApi"]
+
+    assert appsync.get_graphql_api_environment_variables(apiId=api["apiId"])["environmentVariables"] == {}
+
+    put = appsync.put_graphql_api_environment_variables(
+        apiId=api["apiId"], environmentVariables={"FEATURE": "on", "TIER": "local"},
+    )["environmentVariables"]
+    assert put == {"FEATURE": "on", "TIER": "local"}
+
+    got = appsync.get_graphql_api_environment_variables(apiId=api["apiId"])["environmentVariables"]
+    assert got == {"FEATURE": "on", "TIER": "local"}
+
+    # AWS replaces rather than merges
+    replaced = appsync.put_graphql_api_environment_variables(
+        apiId=api["apiId"], environmentVariables={"ONLY": "this"},
+    )["environmentVariables"]
+    assert replaced == {"ONLY": "this"}
+
+
+def test_appsync_update_data_source_and_resolver():
+    """Terraform re-applies an existing API by updating in place, not recreating."""
+    from conftest import make_client
+    appsync = make_client("appsync")
+    api = appsync.create_graphql_api(name="upd-api", authenticationType="API_KEY")["graphqlApi"]
+    appsync.start_schema_creation(apiId=api["apiId"], definition=SDL.encode())
+    appsync.create_data_source(apiId=api["apiId"], name="DS", type="NONE", description="first")
+
+    updated = appsync.update_data_source(
+        apiId=api["apiId"], name="DS", type="NONE", description="second",
+    )["dataSource"]
+    assert updated["description"] == "second"
+    assert appsync.get_data_source(apiId=api["apiId"], name="DS")["dataSource"]["description"] == "second"
+
+    appsync.create_resolver(
+        apiId=api["apiId"], typeName="Query", fieldName="hello", dataSourceName="DS",
+    )
+    appsync.update_resolver(
+        apiId=api["apiId"], typeName="Query", fieldName="hello", dataSourceName="DS",
+        kind="PIPELINE", pipelineConfig={"functions": []},
+    )
+    got = appsync.get_resolver(apiId=api["apiId"], typeName="Query", fieldName="hello")["resolver"]
+    assert got["kind"] == "PIPELINE"
+
+
+def test_appsync_update_api_key():
+    """UpdateApiKey changes the description without minting a new key."""
+    from conftest import make_client
+    appsync = make_client("appsync")
+    api = appsync.create_graphql_api(name="key-api", authenticationType="API_KEY")["graphqlApi"]
+    key = appsync.create_api_key(apiId=api["apiId"], description="before")["apiKey"]
+
+    updated = appsync.update_api_key(
+        apiId=api["apiId"], id=key["id"], description="after",
+    )["apiKey"]
+    assert updated["id"] == key["id"]
+    assert updated["description"] == "after"
+
+
+def test_appsync_graphql_api_reports_server_side_defaults():
+    """apiType and visibility must come back, or a Terraform plan forces replacement.
+
+    Both are ForceNew in the AWS provider, so an API that omits them reads as
+    needing to be recreated on every plan — taking every datasource, function and
+    resolver with it.
+    """
+    from conftest import make_client
+    appsync = make_client("appsync")
+    api = appsync.create_graphql_api(name="defaults-api", authenticationType="API_KEY")["graphqlApi"]
+    assert api["apiType"] == "GRAPHQL"
+    assert api["visibility"] == "GLOBAL"
+    assert api["introspectionConfig"] == "ENABLED"
+
+    got = appsync.get_graphql_api(apiId=api["apiId"])["graphqlApi"]
+    assert got["apiType"] == "GRAPHQL"
+    assert got["visibility"] == "GLOBAL"
+
+
+def test_appsync_delete_api_removes_functions_and_schema():
+    """Deleting an API must drop its functions and schema from the stores.
+
+    Asserted against the stores directly: every read path checks the API exists
+    first, so going through the API would report NotFoundException whether or not
+    the child state was actually released.
+    """
+    import json as _json_mod
+
+    from ministack.services import appsync as _appsync
+
+    resp = _appsync._create_graphql_api({"name": "cascade", "authenticationType": "API_KEY"})
+    api_id = _json_mod.loads(resp[2])["graphqlApi"]["apiId"]
+    _appsync._start_schema_creation(api_id, {"definition": "type Query { hi: String }"})
+    _appsync._create_data_source(api_id, {"name": "DS", "type": "NONE"})
+    _appsync._create_function(api_id, {"name": "fn", "dataSourceName": "DS"})
+
+    assert api_id in _appsync._functions
+    assert api_id in _appsync._schemas
+
+    _appsync._delete_graphql_api(api_id)
+
+    assert api_id not in _appsync._functions, "functions leaked after DeleteGraphqlApi"
+    assert api_id not in _appsync._schemas, "schema leaked after DeleteGraphqlApi"
+    assert api_id not in _appsync._data_sources
+
+
+def test_appsync_update_preserves_creation_time(monkeypatch):
+    """An update must not restamp createdAt, as AWS does not.
+
+    _now() has whole-second granularity, so a create and an update in the same
+    second are indistinguishable; the clock is advanced between them.
+    """
+    import json as _json_mod
+
+    from ministack.services import appsync as _appsync
+
+    clock = {"t": 1_700_000_000}
+    monkeypatch.setattr(_appsync, "_now", lambda: clock["t"])
+
+    resp = _appsync._create_graphql_api({"name": "ctime", "authenticationType": "API_KEY"})
+    api_id = _json_mod.loads(resp[2])["graphqlApi"]["apiId"]
+    created = _json_mod.loads(
+        _appsync._create_data_source(api_id, {"name": "DS", "type": "NONE", "description": "one"})[2]
+    )["dataSource"]
+
+    clock["t"] += 3600
+    updated = _json_mod.loads(
+        _appsync._update_data_source(api_id, "DS", {"type": "NONE", "description": "two"})[2]
+    )["dataSource"]
+
+    assert updated["description"] == "two"
+    assert updated["createdAt"] == created["createdAt"], "createdAt was restamped by the update"
+    assert updated["lastUpdatedAt"] == clock["t"], "lastUpdatedAt should advance"
