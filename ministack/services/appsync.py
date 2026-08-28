@@ -200,18 +200,25 @@ def _create_graphql_api(body):
     if tags:
         _tags[arn] = tags
 
-    return _json(200, {"graphqlApi": record})
+    return _json(200, {"graphqlApi": _api_with_tags(record)})
+
+
+def _api_with_tags(api):
+    """AWS returns tags on the GraphqlApi itself, which is where the Terraform
+    provider reads them. Merged in on read rather than copied onto the record so
+    TagResource and UntagResource stay reflected without a second write."""
+    return {**api, "tags": dict(_tags.get(api.get("arn", ""), {}))}
 
 
 def _get_graphql_api(api_id):
     api = _apis.get(api_id)
     if not api:
         return error_response_json("NotFoundException", f"GraphQL API {api_id} not found", 404)
-    return _json(200, {"graphqlApi": api})
+    return _json(200, {"graphqlApi": _api_with_tags(api)})
 
 
 def _list_graphql_apis(query_params):
-    apis = list(_apis.values())
+    apis = [_api_with_tags(a) for a in _apis.values()]
     return _json(200, {"graphqlApis": apis})
 
 

@@ -1194,3 +1194,34 @@ def test_appsync_update_preserves_creation_time(monkeypatch):
     assert updated["description"] == "two"
     assert updated["createdAt"] == created["createdAt"], "createdAt was restamped by the update"
     assert updated["lastUpdatedAt"] == clock["t"], "lastUpdatedAt should advance"
+
+
+def test_appsync_graphql_api_echoes_its_tags(appsync):
+    """The GraphqlApi object must carry `tags`.
+
+    AWS returns tags on the API itself, and that is where the Terraform provider
+    reads them. CreateGraphqlApi stored them in the ARN-keyed tag store but left
+    them off the record, so tags_all refreshed to empty and every plan proposed
+    the same tag change.
+    """
+    api = appsync.create_graphql_api(
+        name="qa-api-tags",
+        authenticationType="API_KEY",
+        tags={"ourco:env": "ministack"},
+    )["graphqlApi"]
+    assert api.get("tags") == {"ourco:env": "ministack"}
+
+    got = appsync.get_graphql_api(apiId=api["apiId"])["graphqlApi"]
+    assert got.get("tags") == {"ourco:env": "ministack"}
+
+    listed = [
+        a for a in appsync.list_graphql_apis()["graphqlApis"]
+        if a["apiId"] == api["apiId"]
+    ]
+    assert listed and listed[0].get("tags") == {"ourco:env": "ministack"}
+
+    # A tag added later through TagResource must show up on the API too.
+    appsync.tag_resource(resourceArn=api["arn"], tags={"team": "platform"})
+    got = appsync.get_graphql_api(apiId=api["apiId"])["graphqlApi"]
+    assert got["tags"]["team"] == "platform"
+    assert got["tags"]["ourco:env"] == "ministack"
