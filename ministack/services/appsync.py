@@ -17,6 +17,7 @@ Wire protocol:
   Credential scope: appsync
 """
 
+import asyncio
 import base64
 import copy
 import json
@@ -859,6 +860,56 @@ def _flush_api_cache(api_id):
     return _json(200, {})
 
 
+def _evaluate_code(body):
+    """EvaluateCode — run a handler against a supplied context, without deploying.
+
+    This is how AWS lets a resolver be tested before it exists on an API, and it
+    is the operation a CI conformance check calls. Errors come back in the
+    response rather than as a fault, because a resolver raising is a normal
+    outcome of an evaluation.
+    """
+    runtime = body.get("runtime") or {}
+    if runtime.get("name") != "APPSYNC_JS":
+        return error_response_json(
+            "BadRequestException",
+            f"Unsupported runtime {runtime.get('name')!r}; only APPSYNC_JS is evaluated",
+            400)
+    code = body.get("code")
+    if not code:
+        return error_response_json("BadRequestException", "code is required", 400)
+
+    raw_ctx = body.get("context")
+    try:
+        ctx = json.loads(raw_ctx) if isinstance(raw_ctx, str) else (raw_ctx or {})
+    except (TypeError, ValueError):
+        return error_response_json("BadRequestException", "context must be JSON", 400)
+    if not isinstance(ctx, dict):
+        return error_response_json("BadRequestException", "context must be an object", 400)
+    # AppSync's ctx exposes arguments under both names.
+    ctx.setdefault("arguments", ctx.get("args") or {})
+    ctx.setdefault("args", ctx.get("arguments") or {})
+    ctx.setdefault("stash", {})
+
+    fn = body.get("function") or "request"
+    from ministack.core import appsync_js
+    try:
+        status, value, appended, _stash, _skip = appsync_js.evaluate(code, fn, ctx)
+    except appsync_js.AppSyncJsError as exc:
+        return _json(200, {"error": {"message": str(exc),
+                                     "codeErrors": []},
+                           "logs": []})
+    except RuntimeError as exc:
+        return error_response_json("InternalFailureException", str(exc), 500)
+
+    if status == "missing":
+        return _json(200, {"error": {
+            "message": f"code does not export {fn}()", "codeErrors": []}, "logs": []})
+    return _json(200, {
+        "evaluationResult": json.dumps(value),
+        "logs": [f"appendError: {a.get('message')}" for a in appended],
+    })
+
+
 # ---------------------------------------------------------------------------
 # Request router
 # ---------------------------------------------------------------------------
@@ -899,6 +950,9 @@ async def handle_request(method, path, headers, body, query_params):
         else:  # GET
             return _list_tags_for_resource(arn)
 
+    if path == "/v1/dataplane-evaluatecode" and method == "POST":
+        return _evaluate_code(json.loads(body) if body else {})
+
     # GraphQL data plane: POST /graphql or POST /v1/apis/{apiId}/graphql
     if path == "/graphql" and method == "POST":
         api_key = headers.get("x-api-key", "")
@@ -909,7 +963,10 @@ async def handle_request(method, path, headers, body, query_params):
         if not api_id:
             return error_response_json("UnauthorizedException", "Valid API key required", 401)
         data = json.loads(body) if body else {}
-        return _execute_graphql(api_id, data, request_headers=headers)
+        # Resolver execution blocks — an HTTP or Lambda data source may call
+        # back into ministack, and a nested request cannot be served while
+        # the event loop waits on it. Run it on a worker thread.
+        return await asyncio.to_thread(_execute_graphql, api_id, data, headers)
 
     if path.startswith("/v1/apis/") and path.endswith("/graphql") and method == "POST":
         parts = path.split("/")
@@ -918,7 +975,10 @@ async def handle_request(method, path, headers, body, query_params):
             if not _has_sigv4_credentials(headers, query_params):
                 _select_api_region(api_id)
             data = json.loads(body) if body else {}
-            return _execute_graphql(api_id, data, request_headers=headers)
+            # Resolver execution blocks — an HTTP or Lambda data source may call
+            # back into ministack, and a nested request cannot be served while
+            # the event loop waits on it. Run it on a worker thread.
+            return await asyncio.to_thread(_execute_graphql, api_id, data, headers)
 
     m = _PATH_RE.match(path)
     if not m:
@@ -1092,6 +1152,9 @@ def reset():
     _schemas.clear()
     _caches.clear()
     _cache_entries.clear()
+    # Drop the JS worker so its compiled-module cache does not outlive a reset.
+    from ministack.core import appsync_js
+    appsync_js.reset()
     _tags.clear()
 
 
@@ -1158,8 +1221,13 @@ def _restore_api_child_store(store, restored, api_regions):
 import re as _re
 
 # Simple GraphQL parser — handles queries/mutations that Amplify generates
+# An operation may be anonymous and still declare variables, in which case the
+# parenthesis follows the keyword with no space — `mutation($x: T!) { ... }`.
+# That is what every SDK and generated client sends, so the whitespace after the
+# keyword has to be optional; requiring it made the pattern miss, and the bare
+# field fallback then read the whole document as one field named "mutation".
 _GQL_OP_RE = _re.compile(
-    r'(?:query|mutation|subscription)\s+(\w+)?\s*(?:\(([^)]*)\))?\s*\{(.*)\}',
+    r'\b(?:query|mutation|subscription)\b\s*(\w+)?\s*(?:\(([^)]*)\))?\s*\{(.*)\}',
     _re.DOTALL,
 )
 _GQL_FIELD_RE = _re.compile(r'(\w+)\s*(?:\(([^)]*)\))?\s*(?:\{([^}]*)\})?')
@@ -1333,6 +1401,11 @@ def _execute_graphql(api_id, data, request_headers=None):
     # (HTTP 401), not as a HTTP 200 with identity=null.
     identity = None
     api = _apis.get(api_id, {})
+    # A Cognito-authenticated API populates identity from the caller's token.
+    # Resolvers read identity.sub to decide what the caller may see, so leaving
+    # it null makes every permission check fail against an API that works on AWS.
+    if api.get("userPoolConfig"):
+        identity = _cognito_identity(api, request_headers or {})
     if api.get("lambdaAuthorizerConfig"):
         try:
             identity = _invoke_lambda_authorizer(
@@ -1358,18 +1431,42 @@ def _execute_graphql(api_id, data, request_headers=None):
                     results[field_name] = cached
                     continue
             try:
+                appended = []
                 result = _resolve_field(
                     api_id, resolver, args, sub_fields, variables,
                     field_name=field_name,
                     identity=identity,
                     request_headers=request_headers or {},
                     source={},
+                    appended_errors=appended,
                 )
+                # Resolve the fields of whatever this field returned — the
+                # resolvers attached to its own type, with it as ctx.source.
+                field_types = _schema_field_types(api_id)
+                child_type = field_types.get(
+                    f"{'Mutation' if is_mutation else 'Query'}.{field_name}")
+                if child_type and sub_fields:
+                    result = _resolve_selection(
+                        api_id, child_type, result, sub_fields, variables,
+                        identity, request_headers or {}, errors)
                 results[field_name] = result
+                # util.appendError is non-fatal: the field still resolves and
+                # the errors ride alongside the data, as AppSync does.
+                for a in appended:
+                    errors.append({"message": a.get("message"),
+                                   "errorType": a.get("errorType"),
+                                   "path": [field_name]})
                 # Only a successful result is cached; caching an error would
                 # make a transient failure stick for the whole ttl.
                 if cache_hit and result is not None:
                     _cache_put(api_id, cache_hit[0], cache_hit[1], result)
+            except _AppSyncResolverError as e:
+                # util.error and the executor's own refusals carry an errorType,
+                # which clients switch on.
+                errors.append({"message": str(e), "errorType": e.error_type,
+                               "path": [field_name],
+                               **({"data": e.data} if e.data is not None else {})})
+                results[field_name] = None
             except Exception as e:
                 errors.append({"message": str(e), "path": [field_name]})
                 results[field_name] = None
@@ -1493,9 +1590,465 @@ def _find_resolver(api_id, type_name, field_name):
     return None
 
 
+# ---------------------------------------------------------------------------
+# Resolver execution
+#
+# Two registries rather than an elif chain, so a new runtime or data source type
+# is a new entry rather than a new branch in the middle of the executor.
+# ---------------------------------------------------------------------------
+
+
+def _ds_none(api_id, data_source, request_obj, ctx):
+    """A NONE data source echoes the request's payload — this is how AppSync
+    supports resolvers that compute their whole answer locally."""
+    if isinstance(request_obj, dict):
+        return request_obj.get("payload")
+    return None
+
+
+def _ds_http(api_id, data_source, request_obj, ctx):
+    """An HTTP data source performs the request the resolver described.
+
+    AppSync puts {statusCode, headers, body} into ctx.result, with body as a
+    string — a resolver parses it itself, so it must not be decoded here.
+    """
+    import urllib.error
+    import urllib.request
+
+    cfg = data_source.get("httpConfig", {})
+    endpoint = (cfg.get("endpoint") or "").rstrip("/")
+    req = request_obj if isinstance(request_obj, dict) else {}
+    params = req.get("params") or {}
+    url = f"{endpoint}{req.get('resourcePath', '/')}"
+    body = params.get("body")
+    if isinstance(body, str):
+        body = body.encode()
+
+    http_req = urllib.request.Request(
+        url, data=body, method=req.get("method", "POST"),
+        headers={k: str(v) for k, v in (params.get("headers") or {}).items()})
+    try:
+        with urllib.request.urlopen(http_req, timeout=15) as resp:
+            return {"statusCode": resp.status,
+                    "headers": dict(resp.headers.items()),
+                    "body": resp.read().decode("utf-8", errors="replace")}
+    except urllib.error.HTTPError as exc:
+        # A non-2xx is a result the resolver inspects, not a failure — AppSync
+        # hands the status back rather than raising.
+        return {"statusCode": exc.code, "headers": dict(exc.headers.items()),
+                "body": exc.read().decode("utf-8", errors="replace")}
+    except Exception as exc:
+        raise _AppSyncResolverError(f"HTTP data source request failed: {exc}",
+                                    "HttpDataSourceError") from exc
+
+
+def _ds_dynamodb(api_id, data_source, request_obj, ctx):
+    """Run the operation the resolver asked for.
+
+    The non-JS path infers an operation from the field name because it has no
+    request object to read; here the resolver said what it wanted, so honour it.
+    """
+    import ministack.services.dynamodb as _ddb
+
+    cfg = data_source.get("dynamodbConfig", {})
+    table_name = cfg.get("tableName", "")
+    table = _ddb._tables.get(table_name) if table_name else None
+    if table is None:
+        return None
+
+    req = request_obj if isinstance(request_obj, dict) else {}
+    op = req.get("operation", "GetItem")
+    # AppSync's DynamoDB helpers emit AttributeValue-shaped keys and values.
+    key = _ddb_plain(req.get("key") or {})
+    if op == "GetItem":
+        return _ddb_get_item(table, table_name, key, None)
+    if op in ("PutItem", "UpdateItem"):
+        item = {**key, **_ddb_plain(req.get("attributeValues") or {})}
+        return (_ddb_put_item if op == "PutItem" else _ddb_update_item)(
+            table, table_name, item)
+    if op == "DeleteItem":
+        return _ddb_delete_item(table, table_name, key)
+    if op in ("Scan", "Query"):
+        return _ddb_scan(table, table_name, key, None)
+    raise _AppSyncResolverError(
+        f"DynamoDB operation {op} is not supported yet", "NotImplemented")
+
+
+def _ddb_plain(value):
+    """Unwrap AttributeValue shapes ({"S": "x"}) into plain JSON.
+
+    A resolver may hand back either form — the @aws-appsync/utils dynamodb
+    helpers produce the wrapped one, hand-written request objects usually do
+    not — so accept both.
+    """
+    if isinstance(value, dict):
+        if len(value) == 1:
+            (tag, inner), = value.items()
+            if tag in ("S", "N", "BOOL", "B"):
+                return int(inner) if tag == "N" and str(inner).isdigit() else inner
+            if tag == "NULL":
+                return None
+            if tag == "M":
+                return {k: _ddb_plain(v) for k, v in inner.items()}
+            if tag == "L":
+                return [_ddb_plain(v) for v in inner]
+        return {k: _ddb_plain(v) for k, v in value.items()}
+    return value
+
+
+def _ds_lambda(api_id, data_source, request_obj, ctx):
+    """Invoke the Lambda with what the resolver's request() returned.
+
+    A JS resolver returning {operation: "Invoke", payload} sends that payload as
+    the event, verbatim — AppSync does not wrap it. Wrapping it in the standard
+    resolver event means a function expecting its own shape receives something
+    else entirely, and the failure surfaces back in the resolver rather than
+    where it was caused.
+
+    Without an explicit payload there is nothing the resolver has shaped, so the
+    standard resolver event is the right thing to send, which is what a data
+    source with no JS code has always received.
+    """
+    req = request_obj if isinstance(request_obj, dict) else {}
+    if isinstance(req, dict) and "payload" in req:
+        return _invoke_lambda_with_event(data_source, req["payload"])
+    return _resolve_lambda(
+        api_id=api_id,
+        resolver={"fieldName": (ctx.get("info") or {}).get("fieldName", "")},
+        data_source=data_source,
+        args=(ctx.get("args") or {}),
+        field_name=(ctx.get("info") or {}).get("fieldName", ""),
+        identity=ctx.get("identity"),
+        request_headers=(ctx.get("request") or {}).get("headers") or {},
+        source=ctx.get("source") or {},
+        variables=(ctx.get("info") or {}).get("variables") or {},
+    )
+
+
+def _invoke_lambda_with_event(data_source, event):
+    """Invoke a data source's Lambda with an exact event, and unwrap its body."""
+    config = data_source.get("lambdaConfig", {})
+    func_arn = config.get("lambdaFunctionArn", "")
+    if not func_arn:
+        raise _AppSyncResolverError(
+            "Lambda data source has no lambdaFunctionArn", "InvalidDataSource")
+
+    import ministack.services.lambda_svc as _lambda_svc
+    func, func_config, func_name = _lambda_svc._get_func_record_for_ref(func_arn)
+    if not func or not func_config:
+        raise _AppSyncResolverError(
+            f"Lambda function {func_arn} not found", "FunctionNotFound")
+
+    try:
+        exec_record = _lambda_svc._execution_record_for_config(func, func_config)
+        result = _lambda_svc._execute_function_with_config_scope(exec_record, event)
+    except Exception as exc:
+        raise _AppSyncResolverError(
+            f"Lambda invocation error: {exc}", "LambdaExecutionError") from exc
+
+    if not isinstance(result, dict) or result.get("error"):
+        body = result.get("body") if isinstance(result, dict) else None
+        msg = body.get("errorMessage") if isinstance(body, dict) else "Lambda execution error"
+        raise _AppSyncResolverError(msg or "Lambda execution error", "LambdaExecutionError")
+
+    body = result.get("body")
+    if isinstance(body, (str, bytes)):
+        try:
+            return json.loads(body)
+        except (json.JSONDecodeError, ValueError):
+            return body
+    return body
+
+
+# type -> handler. RELATIONAL_DATABASE and AMAZON_OPENSEARCH_SERVICE are
+# accepted by the control plane and have no handler yet; a resolver over one
+# refuses clearly rather than silently answering a mock.
+_DATA_SOURCE_HANDLERS = {
+    "NONE": _ds_none,
+    "HTTP": _ds_http,
+    "AMAZON_DYNAMODB": _ds_dynamodb,
+    "AWS_LAMBDA": _ds_lambda,
+}
+
+
+class _AppSyncResolverError(Exception):
+    def __init__(self, message, error_type="UnknownError", data=None, error_info=None):
+        super().__init__(message)
+        self.error_type = error_type
+        self.data = data
+        self.error_info = error_info
+
+
+_SDL_TYPE_RE = _re.compile(r"\btype\s+(\w+)\s*(?:implements[^{]*)?\{([^}]*)\}", _re.S)
+_SDL_FIELD_RE = _re.compile(r"^\s*(\w+)\s*(?:\([^)]*\))?\s*:\s*([\[\]\w!]+)", _re.M)
+
+
+def _schema_field_types(api_id):
+    """Map "Type.field" -> the field's type name, parsed from the API's SDL.
+
+    Nested resolution needs to know what type a field returns so it can look up
+    the resolvers attached to that type. Parsed from the stored schema rather
+    than inferred, and cached per API — the alternative is a GraphQL parser,
+    which is a dependency for something this small.
+    """
+    schema = _schemas.get(api_id) or {}
+    sdl = schema.get("definition") or ""
+    if not sdl:
+        return {}
+    cached = schema.get("_field_types")
+    if cached is not None and schema.get("_field_types_for") == len(sdl):
+        return cached
+
+    out = {}
+    for type_name, body in _SDL_TYPE_RE.findall(sdl):
+        for field, ftype in _SDL_FIELD_RE.findall(body):
+            out[f"{type_name}.{field}"] = ftype.strip("[]!")
+    schema["_field_types"] = out
+    schema["_field_types_for"] = len(sdl)
+    return out
+
+
+def _resolve_selection(api_id, type_name, value, sub_fields, variables,
+                       identity, request_headers, errors, depth=0):
+    """Run the resolvers attached to a resolved value's own type.
+
+    AppSync resolves a field, then resolves the fields of whatever that field
+    returned, passing the parent as ctx.source. Without this only the top-level
+    Query/Mutation fields ever run.
+    """
+    if depth > 10 or not sub_fields or not isinstance(value, dict):
+        return value
+    field_types = _schema_field_types(api_id)
+    type_resolvers = (_resolvers.get(api_id) or {}).get(type_name) or {}
+    if not type_resolvers:
+        return value
+
+    for sub in sub_fields:
+        name = sub if isinstance(sub, str) else sub.get("name")
+        nested = None if isinstance(sub, str) else sub.get("sub_fields")
+        resolver = type_resolvers.get(name)
+        if not resolver:
+            continue
+        try:
+            child = _resolve_field(
+                api_id, resolver, {}, nested or [], variables,
+                field_name=name, identity=identity,
+                request_headers=request_headers, source=value,
+                appended_errors=errors, type_name=type_name)
+        except _AppSyncResolverError as exc:
+            errors.append({"message": str(exc), "errorType": exc.error_type,
+                           "path": [name]})
+            child = None
+        child_type = field_types.get(f"{type_name}.{name}")
+        if child_type and nested:
+            child = _resolve_selection(
+                api_id, child_type, child, nested, variables, identity,
+                request_headers, errors, depth + 1)
+        value[name] = child
+    return value
+
+
+def _cognito_identity(api, request_headers):
+    """Build ctx.identity from a Cognito token on the request.
+
+    The token's claims are read, not verified — ministack has no auth by design
+    and its own Cognito issues these tokens. What matters for a resolver is that
+    sub, username, groups and the claim set are present and consistent with the
+    pool that issued them.
+    """
+    auth = request_headers.get("authorization") or request_headers.get("Authorization") or ""
+    token = auth[7:] if auth[:7].lower() == "bearer " else auth
+    parts = token.split(".")
+    if len(parts) != 3:
+        return None
+    try:
+        padded = parts[1] + "=" * (-len(parts[1]) % 4)
+        claims = json.loads(base64.urlsafe_b64decode(padded))
+    except Exception:
+        return None
+    if not isinstance(claims, dict) or not claims.get("sub"):
+        return None
+    return {
+        "sub": claims.get("sub"),
+        "username": claims.get("cognito:username") or claims.get("username") or claims.get("sub"),
+        "claims": claims,
+        "sourceIp": ["127.0.0.1"],
+        "defaultAuthStrategy": (api.get("userPoolConfig") or {}).get("defaultAction", "ALLOW"),
+        "groups": claims.get("cognito:groups"),
+        "issuer": claims.get("iss"),
+    }
+
+
+def _api_env(api_id):
+    """The API's environment variables, which resolvers read as ctx.env."""
+    return (_apis.get(api_id) or {}).get("environmentVariables") or {}
+
+
+def _js_ctx(args, identity, source, request_headers, variables, field_name,
+            type_name, stash, prev, result=None, api_env=None, error=None):
+    """The ctx an APPSYNC_JS resolver sees."""
+    ctx = {
+        "arguments": args or {},
+        "args": args or {},
+        "identity": identity,
+        "source": source or {},
+        "stash": stash if stash is not None else {},
+        "prev": {"result": prev},
+        "request": {"headers": request_headers or {}},
+        "info": {
+            "fieldName": field_name,
+            "parentTypeName": type_name,
+            "variables": variables or {},
+            "selectionSetList": [],
+        },
+    }
+    if result is not None:
+        ctx["result"] = result
+    if api_env:
+        ctx["env"] = api_env
+    if error is not None:
+        # AppSync sets ctx.error when the data source failed, and still runs
+        # response() so the resolver can turn it into its own error or a value.
+        ctx["error"] = error
+    return ctx
+
+
+def _js_evaluate(code, fn, ctx, errors):
+    """Evaluate one handler, translating a resolver error into the executor's."""
+    from ministack.core import appsync_js
+    try:
+        status, value, appended, stash, skip_to = appsync_js.evaluate(code, fn, ctx)
+    except appsync_js.AppSyncJsError as exc:
+        raise _AppSyncResolverError(str(exc), exc.error_type, exc.data,
+                                    exc.error_info) from exc
+    errors.extend(appended)
+    # Carry the mutated stash back into the ctx the caller holds, so the next
+    # stage of a pipeline sees what this one stashed.
+    if isinstance(ctx.get("stash"), dict) and isinstance(stash, dict):
+        ctx["stash"].clear()
+        ctx["stash"].update(stash)
+    return status, value, skip_to
+
+
+def _run_js_stage(api_id, unit, args, identity, source, request_headers,
+                  variables, field_name, type_name, stash, prev, errors):
+    """Run one APPSYNC_JS unit — a resolver or a pipeline function.
+
+    Returns (status, value): "ok" with the response value, or "earlyReturn"
+    with the value the caller must return immediately.
+    """
+    code = unit.get("code") or ""
+    ds_name = unit.get("dataSourceName", "")
+    data_source = _data_sources.get(api_id, {}).get(ds_name)
+
+    ctx = _js_ctx(args, identity, source, request_headers, variables,
+                  field_name, type_name, stash, prev, api_env=_api_env(api_id))
+    status, request_obj, skip_to = _js_evaluate(code, "request", ctx, errors)
+    if status == "earlyReturn":
+        # AWS: the data source and this handler's response are skipped, and the
+        # value becomes the result the next stage sees. skipTo "END" ends the
+        # pipeline instead; anything else continues.
+        return ("earlyReturnEnd" if skip_to == "END" else "earlyReturn"), request_obj
+    if status == "missing":
+        raise _AppSyncResolverError(
+            f"{type_name}.{field_name}: APPSYNC_JS code exports no request()",
+            "InvalidResolver")
+
+    ds_error = None
+    if data_source is None:
+        result = None
+    else:
+        ds_type = data_source.get("type", "NONE")
+        handler = _DATA_SOURCE_HANDLERS.get(ds_type)
+        if handler is None:
+            raise _AppSyncResolverError(
+                f"Data source type {ds_type} is not executable yet", "NotImplemented")
+        try:
+            result = handler(api_id, data_source, request_obj, ctx)
+        except _AppSyncResolverError as exc:
+            # AppSync hands a data source failure to response() as ctx.error
+            # rather than skipping it, so the resolver can map it to its own.
+            result = None
+            ds_error = {"message": str(exc), "type": exc.error_type}
+
+    ctx = _js_ctx(args, identity, source, request_headers, variables,
+                  field_name, type_name, stash, prev, result=result,
+                  api_env=_api_env(api_id), error=ds_error)
+    status, value, skip_to = _js_evaluate(code, "response", ctx, errors)
+    if status == "earlyReturn":
+        return ("earlyReturnEnd" if skip_to == "END" else "earlyReturn"), value
+    if status == "missing":
+        # AppSync requires response() on a JS resolver, but returning the raw
+        # result is more useful than failing the field outright.
+        return "ok", result
+    return "ok", value
+
+
+def _resolve_appsync_js(api_id, resolver, args, variables, field_name,
+                        type_name, identity, request_headers, source, errors):
+    """Execute an APPSYNC_JS resolver — unit, or pipeline with its functions."""
+    stash = {}
+    if resolver.get("kind") == "PIPELINE":
+        # The resolver's own request() is the "before" step; it may stash values
+        # or end the whole pipeline.
+        ctx = _js_ctx(args, identity, source, request_headers, variables,
+                      field_name, type_name, stash, None)
+        status, _before, _skip = _js_evaluate(
+            resolver.get("code") or "", "request", ctx, errors)
+        stash = ctx["stash"]
+        prev = None
+        if status == "earlyReturn":
+            # AWS: the pipeline is skipped and the resolver's response handler
+            # runs immediately — it is not bypassed, so a resolver that shapes
+            # its answer there still gets to.
+            prev = _before
+        else:
+            for fn_id in (resolver.get("pipelineConfig") or {}).get("functions") or []:
+                fn = (_functions.get(api_id) or {}).get(fn_id)
+                if not fn:
+                    raise _AppSyncResolverError(
+                        f"Pipeline function {fn_id} not found", "InvalidResolver")
+                status, value = _run_js_stage(
+                    api_id, fn, args, identity, source, request_headers, variables,
+                    fn.get("name", field_name), type_name, stash, prev, errors)
+                prev = value
+                if status == "earlyReturnEnd":
+                    break
+
+        # The resolver's response handler sees both: ctx.prev.result is the last
+        # function's result, and ctx.result is the resolver's own result, which
+        # for a pipeline is the same value. AWS provides both, and resolvers use
+        # either — a template returning ctx.result got null without this.
+        ctx = _js_ctx(args, identity, source, request_headers, variables,
+                      field_name, type_name, stash, prev, result=prev)
+        status, value, _ = _js_evaluate(
+            resolver.get("code") or "", "response", ctx, errors)
+        return prev if status == "missing" else value
+
+    status, value = _run_js_stage(
+        api_id, resolver, args, identity, source, request_headers, variables,
+        field_name, type_name, stash, None, errors)
+    return value
+
+
 def _resolve_field(api_id, resolver, args, sub_fields, variables,
-                   field_name=None, identity=None, request_headers=None, source=None):
-    """Execute a resolver against its data source (DynamoDB or Lambda)."""
+                   field_name=None, identity=None, request_headers=None, source=None,
+                   appended_errors=None, type_name=None):
+    """Execute a resolver against its data source.
+
+    An APPSYNC_JS resolver runs its own code; anything else keeps the previous
+    behaviour of dispatching on the data source type and inferring an operation
+    from the field arguments.
+    """
+    runtime_name = (resolver.get("runtime") or {}).get("name")
+    if runtime_name == "APPSYNC_JS" and resolver.get("code"):
+        return _resolve_appsync_js(
+            api_id, resolver, args or {}, variables or {},
+            field_name or resolver.get("fieldName", ""),
+            type_name or resolver.get("typeName", "Query"),
+            identity, request_headers or {}, source or {},
+            appended_errors if appended_errors is not None else [])
+
     ds_name = resolver.get("dataSourceName", "")
     data_source = _data_sources.get(api_id, {}).get(ds_name)
 
