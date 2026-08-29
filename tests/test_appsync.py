@@ -2190,3 +2190,61 @@ def test_appsync_cognito_api_refuses_an_unauthenticated_request(appsync, cognito
                  json={"query": "{ secret }"}, timeout=15)
     assert r.status_code == 401, f"expected 401, got {r.status_code} {r.text[:200]}"
     assert "LEAKED" not in r.text
+
+
+def test_appsync_schemaless_api_keeps_lenient_execution(ddb):
+    """An API with no schema is executed leniently, exactly as before.
+
+    Validation is a per-API property that appears when a schema does: parsing
+    always happens, but a query is only checked against a schema once one has
+    been uploaded. Every API created before StartSchemaCreation existed is
+    schemaless, so validating those would start rejecting queries that work
+    today — this pins that it does not.
+    """
+    import json
+    import urllib.request
+    from conftest import make_client
+
+    appsync = make_client("appsync")
+
+    ddb.create_table(
+        TableName="schemaless-users",
+        KeySchema=[{"AttributeName": "id", "KeyType": "HASH"}],
+        AttributeDefinitions=[{"AttributeName": "id", "AttributeType": "S"}],
+        BillingMode="PAY_PER_REQUEST",
+    )
+
+    api = appsync.create_graphql_api(
+        name="schemaless-api", authenticationType="API_KEY")["graphqlApi"]
+    api_id = api["apiId"]
+    key = appsync.create_api_key(apiId=api_id)["apiKey"]
+
+    appsync.create_data_source(
+        apiId=api_id, name="usersDS", type="AMAZON_DYNAMODB",
+        dynamodbConfig={"tableName": "schemaless-users", "awsRegion": "us-east-1"},
+    )
+    appsync.create_resolver(
+        apiId=api_id, typeName="Mutation", fieldName="createUser",
+        dataSourceName="usersDS",
+    )
+
+    # No StartSchemaCreation call — this API has no schema at all.
+    assert not appsync.get_graphql_api(apiId=api_id)["graphqlApi"].get("_schema")
+
+    def _post(query):
+        req = urllib.request.Request(
+            f"{_ENDPOINT}/v1/apis/{api_id}/graphql",
+            data=json.dumps({"query": query}).encode(),
+            headers={"Content-Type": "application/json", "x-api-key": key["id"]},
+        )
+        with urllib.request.urlopen(req) as r:
+            return json.loads(r.read())
+
+    body = _post('mutation { createUser(input: {id: "u1", name: "Ada"}) { id name } }')
+    assert "errors" not in body, body
+    assert body["data"]["createUser"]["id"] == "u1", body
+
+    # The decisive half: with a schema this field would be a validation error
+    # before any resolver ran. Schemaless, it must still reach the resolver.
+    body = _post('mutation { createUser(input: {id: "u2", nope: 1}) { id } }')
+    assert body.get("data", {}).get("createUser", {}).get("id") == "u2", body
