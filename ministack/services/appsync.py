@@ -1373,6 +1373,53 @@ def _unauthorized_response():
     })
 
 
+# Off by default: ministack has no authentication of its own by design, and a
+# suite written against the permissive behaviour would start failing. Set
+# APPSYNC_ENFORCE_AUTH=1 to have an API refuse a caller that satisfies none of
+# its configured providers, the way AWS does — which is what makes an
+# authorization test meaningful.
+_ENFORCE_AUTH = os.environ.get("APPSYNC_ENFORCE_AUTH", "0") not in ("0", "", "false", "False")
+
+
+def _auth_modes(api):
+    """Every authentication type the API accepts."""
+    modes = {api.get("authenticationType") or "API_KEY"}
+    for extra in api.get("additionalAuthenticationProviders") or []:
+        t = extra.get("authenticationType") if isinstance(extra, dict) else extra
+        if t:
+            modes.add(t)
+    return modes
+
+
+def _request_is_authenticated(api_id, api, request_headers):
+    """Whether the request satisfies any of the API's configured providers.
+
+    AppSync accepts a request if any one provider accepts it. Credentials are
+    not verified here — ministack issued these tokens and does not check
+    signatures — but a request carrying nothing at all matches no provider, and
+    that is the case worth refusing: it is the one that makes an authorization
+    test pass no matter what the resolvers do.
+    """
+    headers = {str(k).lower(): v for k, v in (request_headers or {}).items()}
+    modes = _auth_modes(api)
+    auth = str(headers.get("authorization") or "")
+
+    if "API_KEY" in modes:
+        supplied = headers.get("x-api-key")
+        if supplied and supplied in (_api_keys.get(api_id) or {}):
+            return True
+    if {"AMAZON_COGNITO_USER_POOLS", "OPENID_CONNECT"} & modes:
+        # A bearer token, as distinct from a SigV4 credential.
+        if auth and not auth.startswith("AWS4-HMAC-SHA256"):
+            return True
+    if "AWS_IAM" in modes and auth.startswith("AWS4-HMAC-SHA256"):
+        return True
+    if "AWS_LAMBDA" in modes and api.get("lambdaAuthorizerConfig"):
+        # The authorizer runs below and may still reject.
+        return True
+    return False
+
+
 def _execute_with_schema(api_id, sdl, query, variables, operation_name, request_headers):
     """Execute against the API's schema with the real GraphQL algorithm."""
     from ministack.core import appsync_graphql
@@ -1441,6 +1488,12 @@ def _execute_graphql(api_id, data, request_headers=None):
 
     if api_id not in _apis:
         return _json(404, {"errors": [{"message": f"API {api_id} not found"}]})
+
+    # Applied before either execution path, so it does not depend on whether the
+    # API has a schema.
+    if _ENFORCE_AUTH and not _request_is_authenticated(
+            api_id, _apis.get(api_id, {}), request_headers or {}):
+        return _unauthorized_response()
 
     # A schema means the real engine: parse, validate, execute. The regex path
     # below is kept only for an API that has no schema yet, where there is

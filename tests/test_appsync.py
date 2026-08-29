@@ -2154,3 +2154,39 @@ def test_appsync_js_lambda_datasource_receives_the_payload_verbatim(appsync, lam
     got = _graphql(api_id, key, '{ echo }')["data"]["echo"]
     assert got == {"text": ["a", "b"]}, \
         f"the payload must arrive verbatim, not wrapped in a resolver event: {got}"
+
+
+@pytest.mark.skipif(
+    os.environ.get("APPSYNC_ENFORCE_AUTH", "0") in ("0", "", "false", "False"),
+    reason="enforcement is opt-in; run the server with APPSYNC_ENFORCE_AUTH=1")
+def test_appsync_cognito_api_refuses_an_unauthenticated_request(appsync, cognito_idp):
+    """An API whose auth mode is AMAZON_COGNITO_USER_POOLS refuses a caller with
+    no credentials.
+
+    ministack already refuses an unknown API key on this path, so an API that
+    declares Cognito should likewise not serve an anonymous caller — otherwise
+    every authorization test passes locally regardless of what the resolvers do,
+    which is the opposite of useful.
+    """
+    pool = cognito_idp.create_user_pool(PoolName="qa-authmode-pool")["UserPool"]
+    api = appsync.create_graphql_api(
+        name="qa-authmode", authenticationType="AMAZON_COGNITO_USER_POOLS",
+        userPoolConfig={"userPoolId": pool["Id"], "awsRegion": "us-east-1",
+                        "defaultAction": "ALLOW"},
+    )["graphqlApi"]
+    api_id = api["apiId"]
+    appsync.create_data_source(apiId=api_id, name="DS", type="NONE")
+    appsync.create_resolver(
+        apiId=api_id, typeName="Query", fieldName="secret", dataSourceName="DS",
+        runtime={"name": "APPSYNC_JS", "runtimeVersion": "1.0.0"},
+        code="""
+            export function request(ctx) { return { payload: 'LEAKED' } }
+            export function response(ctx) { return ctx.result }
+        """)
+
+    import requests as _rq
+    r = _rq.post(f"{_ENDPOINT}/v1/apis/{api_id}/graphql",
+                 headers={"content-type": "application/json"},
+                 json={"query": "{ secret }"}, timeout=15)
+    assert r.status_code == 401, f"expected 401, got {r.status_code} {r.text[:200]}"
+    assert "LEAKED" not in r.text
