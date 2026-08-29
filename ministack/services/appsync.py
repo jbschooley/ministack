@@ -267,6 +267,8 @@ def _delete_graphql_api(api_id):
     _functions.pop(api_id, None)
     _schemas.pop(api_id, None)
     _caches.pop(api_id, None)
+    from ministack.core import appsync_graphql
+    appsync_graphql.forget_schema(api_id)
     _cache_entries.pop(api_id, None)
     _tags.pop(arn, None)
 
@@ -560,6 +562,8 @@ def _start_schema_creation(api_id, body):
     elif isinstance(definition, (bytes, bytearray)):
         definition = definition.decode("utf-8", "replace")
 
+    from ministack.core import appsync_graphql
+    appsync_graphql.forget_schema(api_id)
     _schemas[api_id] = {
         "definition": definition,
         "status": "SUCCESS",
@@ -1153,8 +1157,9 @@ def reset():
     _caches.clear()
     _cache_entries.clear()
     # Drop the JS worker so its compiled-module cache does not outlive a reset.
-    from ministack.core import appsync_js
+    from ministack.core import appsync_graphql, appsync_js
     appsync_js.reset()
+    appsync_graphql.forget_schema()
     _tags.clear()
 
 
@@ -1368,6 +1373,63 @@ def _unauthorized_response():
     })
 
 
+def _execute_with_schema(api_id, sdl, query, variables, operation_name, request_headers):
+    """Execute against the API's schema with the real GraphQL algorithm."""
+    from ministack.core import appsync_graphql
+
+    api = _apis.get(api_id, {})
+    identity = None
+    if api.get("userPoolConfig"):
+        identity = _cognito_identity(api, request_headers)
+    if api.get("lambdaAuthorizerConfig"):
+        try:
+            identity = _invoke_lambda_authorizer(
+                api_id, api["lambdaAuthorizerConfig"], request_headers,
+                query=query, variables=variables, operation_name=operation_name)
+        except _AuthorizerRejected:
+            return _unauthorized_response()
+
+    appended = []
+
+    def field_resolver(source, info, **args):
+        """Called for every field graphql-core resolves."""
+        type_name = info.parent_type.name
+        field_name = info.field_name
+
+        resolver = (_resolvers.get(api_id) or {}).get(type_name, {}).get(field_name)
+        if resolver is None:
+            # No resolver on this field: read it off the parent, which is how
+            # AppSync resolves a plain attribute of a returned object.
+            if isinstance(source, dict):
+                return source.get(field_name)
+            return getattr(source, field_name, None)
+
+        return _resolve_field(
+            api_id, resolver, args, [], variables,
+            field_name=field_name,
+            identity=identity,
+            request_headers=request_headers,
+            source=source if isinstance(source, dict) else {},
+            appended_errors=appended,
+            type_name=type_name,
+        )
+
+    try:
+        data, errors = appsync_graphql.execute(
+            api_id, sdl, query, variables, operation_name, field_resolver, None)
+    except appsync_graphql.SchemaUnavailable as exc:
+        return _json(200, {"data": None, "errors": [{"message": str(exc)}]})
+
+    # util.appendError is non-fatal and rides alongside the data.
+    for a in appended:
+        errors.append({"message": a.get("message"), "errorType": a.get("errorType")})
+
+    body = {"data": data}
+    if errors:
+        body["errors"] = errors
+    return _json(200, body)
+
+
 def _execute_graphql(api_id, data, request_headers=None):
     """Execute a GraphQL query/mutation against the configured resolvers."""
     query = data.get("query", "")
@@ -1379,6 +1441,14 @@ def _execute_graphql(api_id, data, request_headers=None):
 
     if api_id not in _apis:
         return _json(404, {"errors": [{"message": f"API {api_id} not found"}]})
+
+    # A schema means the real engine: parse, validate, execute. The regex path
+    # below is kept only for an API that has no schema yet, where there is
+    # nothing to validate against.
+    sdl = (_schemas.get(api_id) or {}).get("definition")
+    if sdl:
+        return _execute_with_schema(
+            api_id, sdl, query, variables, operation_name, request_headers or {})
 
     # Parse the top-level operation
     # Strip __typename fields — Amplify adds these everywhere
