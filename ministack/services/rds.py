@@ -3020,9 +3020,12 @@ def _cluster_endpoint_aliases(cluster):
     address. Docker's embedded DNS accepts dotted names, so the alias can be the
     real endpoint rather than something invented alongside it.
 
-    The writer endpoint only. ReaderEndpoint has to follow whichever member is
-    currently a reader, and a cluster can promote one on failover, so pinning it
-    to the writer's container would answer with the wrong database.
+    ReaderEndpoint is included only when per-instance reader containers are off,
+    which is the default. With them off a cluster's reads always resolve to this
+    same container, so the reader name belongs on it too — and consumers store
+    that endpoint exactly as they store the writer's. With them on, reads can
+    move to a standby, and a name pinned here would answer from the wrong
+    database, so it is left alone.
     """
     value = cluster.get("Endpoint")
     # Two shapes in practice: a bare string when the cluster is created, and the
@@ -3032,9 +3035,17 @@ def _cluster_endpoint_aliases(cluster):
     if isinstance(value, dict):
         value = value.get("Address")
     # A name, not an address: an earlier container may have left one here.
+    names = []
     if isinstance(value, str) and value and not value[0].isdigit():
-        return [value]
-    return []
+        names.append(value)
+    if not RDS_PG_CLUSTER_REPLICATION:
+        reader = cluster.get("ReaderEndpoint")
+        if isinstance(reader, dict):
+            reader = reader.get("Address")
+        if (isinstance(reader, str) and reader and not reader[0].isdigit()
+                and reader not in names):
+            names.append(reader)
+    return names
 
 
 def _next_port():
@@ -3483,11 +3494,14 @@ def _sync_cluster_endpoints(cluster):
     reader_endpoint = _cluster_reader_endpoint(cluster) or endpoint
     cluster["Endpoint"] = endpoint.get("Address", cluster.get("Endpoint", ""))
     if reader_endpoint is endpoint:
-        # Falling back to the writer's container. The writer's Address may be a
-        # network alias, which is stable precisely because it is pinned to one
-        # container — and the reader endpoint must be free to move to a standby
-        # when one appears. Publish the address here, as before.
-        reader_address = (
+        # Reads fall back to the writer's container. If the reader name was
+        # aliased onto it — the default, where reads never move — publish the
+        # name, so consumers store something that stays valid. With per-instance
+        # readers enabled the name is not aliased and reads can move to a
+        # standby, so publish the address as before.
+        aliased = _cluster_endpoint_aliases(cluster)
+        reader_name = aliased[1] if len(aliased) > 1 else None
+        reader_address = reader_name or (
             cluster.get("_shared_internal_address")
             or endpoint.get("Address", cluster.get("ReaderEndpoint", ""))
         )
