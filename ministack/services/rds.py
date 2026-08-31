@@ -1114,9 +1114,12 @@ def _start_cluster_shared_container(cluster_id, cluster, remove_stale=False):
         else []
     )
     if endpoint_aliases:
+        # The endpoint config is written out directly rather than through
+        # docker_client.api.create_endpoint_config, which returns exactly this
+        # dict. Reaching for .api also reaches past the test doubles this module
+        # is exercised with, and they have no such attribute.
         container_kwargs["networking_config"] = {
-            container_kwargs["network"]:
-                docker_client.api.create_endpoint_config(aliases=endpoint_aliases),
+            container_kwargs["network"]: {"Aliases": list(endpoint_aliases)},
         }
     try:
         container = docker_client.containers.run(**container_kwargs)
@@ -3479,9 +3482,20 @@ def _sync_cluster_endpoints(cluster):
         return
     reader_endpoint = _cluster_reader_endpoint(cluster) or endpoint
     cluster["Endpoint"] = endpoint.get("Address", cluster.get("Endpoint", ""))
-    cluster["ReaderEndpoint"] = reader_endpoint.get(
-        "Address", cluster.get("ReaderEndpoint", ""),
-    )
+    if reader_endpoint is endpoint:
+        # Falling back to the writer's container. The writer's Address may be a
+        # network alias, which is stable precisely because it is pinned to one
+        # container — and the reader endpoint must be free to move to a standby
+        # when one appears. Publish the address here, as before.
+        reader_address = (
+            cluster.get("_shared_internal_address")
+            or endpoint.get("Address", cluster.get("ReaderEndpoint", ""))
+        )
+    else:
+        reader_address = reader_endpoint.get(
+            "Address", cluster.get("ReaderEndpoint", ""),
+        )
+    cluster["ReaderEndpoint"] = reader_address
     cluster["Port"] = int(endpoint.get("Port", cluster.get("Port", 0)))
 
 

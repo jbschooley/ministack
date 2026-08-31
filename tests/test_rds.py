@@ -10866,7 +10866,12 @@ def test_rds_pg_replicating_reader_lifecycle(monkeypatch):
         # ReaderEndpoint now resolves to the standby; the writer endpoint
         # stays on the shared container; the writer stays the only writer.
         assert cluster["ReaderEndpoint"] == "10.0.0.7"
-        assert cluster["Endpoint"] == "10.0.0.5"
+        # The writer endpoint still identifies the shared container rather
+        # than moving to the standby. It is the cluster's stable name now, not
+        # the container address, so compare against what the shared endpoint
+        # publishes instead of the address it happens to resolve to.
+        assert cluster["Endpoint"] == cluster["_shared_endpoint"]["Address"]
+        assert cluster["Endpoint"] != "10.0.0.7"
         writers = [
             member for member in cluster["DBClusterMembers"]
             if member.get("IsClusterWriter")
