@@ -12999,7 +12999,7 @@ def test_rds_modify_cluster_sets_serverlessv2_scaling_configuration(rds):
     assert slv2["MaxCapacity"] == 8.0
 
 
-def test_rds_cluster_endpoint_alias_survives_the_record_changing_shape(monkeypatch):
+def test_rds_cluster_endpoint_alias_survives_the_record_changing_shape():
     """The endpoint alias is read from both shapes the cluster record takes.
 
     A cluster carries ``Endpoint`` as a bare string when it is created and as an
@@ -13022,24 +13022,11 @@ def test_rds_cluster_endpoint_alias_survives_the_record_changing_shape(monkeypat
         {"Endpoint": {"Address": "172.20.0.4"}}) == []
     assert rds_service._cluster_endpoint_aliases({}) == []
 
-    # ReaderEndpoint rides on this same container while per-instance reader
-    # containers are off, which is the default: every read resolves here, and
-    # consumers store the reader endpoint exactly as they store the writer's.
-    reader = "ro.cluster-abc.rds.amazonaws.com"
-    monkeypatch.setattr(rds_service, "RDS_PG_CLUSTER_REPLICATION", False)
+    # ReaderEndpoint is deliberately not aliased: it has to follow whichever
+    # member is currently a reader, and failover moves that.
     assert rds_service._cluster_endpoint_aliases(
-        {"Endpoint": name, "ReaderEndpoint": reader}) == [name, reader]
-    assert rds_service._cluster_endpoint_aliases(
-        {"Endpoint": name, "ReaderEndpoint": {"Address": reader}}) == [name, reader]
-    # A cluster that advertises one name for both registers it once.
-    assert rds_service._cluster_endpoint_aliases(
-        {"Endpoint": name, "ReaderEndpoint": name}) == [name]
-
-    # With reader containers on, a read can land on a standby, so pinning the
-    # reader name here would answer from the wrong database.
-    monkeypatch.setattr(rds_service, "RDS_PG_CLUSTER_REPLICATION", True)
-    assert rds_service._cluster_endpoint_aliases(
-        {"Endpoint": name, "ReaderEndpoint": reader}) == [name]
+        {"Endpoint": name, "ReaderEndpoint": "ro.cluster-abc.rds.amazonaws.com"}
+    ) == [name]
 
 
 def test_rds_network_aliases_only_on_user_defined_networks():
