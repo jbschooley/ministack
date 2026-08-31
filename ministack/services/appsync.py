@@ -1160,6 +1160,8 @@ def reset():
     from ministack.core import appsync_graphql, appsync_js
     appsync_js.reset()
     appsync_graphql.forget_schema()
+    from ministack.core import appsync_js
+    appsync_js.reset()
     _tags.clear()
 
 

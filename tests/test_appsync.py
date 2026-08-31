@@ -1326,6 +1326,12 @@ def _graphql(api_id, api_key, query, variables=None):
     r = _rq.post(f"{_ENDPOINT}/v1/apis/{api_id}/graphql",
                  headers={"x-api-key": api_key, "content-type": "application/json"},
                  json=payload, timeout=15)
+def _graphql(api_id, api_key, query):
+    """POST a query to the API's data plane the way an SDK would."""
+    import requests as _rq
+    r = _rq.post(f"{_ENDPOINT}/v1/apis/{api_id}/graphql",
+                 headers={"x-api-key": api_key, "content-type": "application/json"},
+                 json={"query": query}, timeout=15)
     return r.json()
 
 def _cache_ds_api(appsync, ddb, name):
@@ -1981,6 +1987,12 @@ def test_appsync_js_function_early_return_continues_the_pipeline(appsync):
     function request handler (or the pipeline resolver response handler if this
     was the last AWS AppSync function) is called."
 
+def test_appsync_js_function_early_return_continues_the_pipeline(appsync):
+    """earlyReturn in a FUNCTION skips its data source and response — and the
+    pipeline continues to the next function.
+    AWS: "the data source and response handler are skipped, and the next
+    function request handler (or the pipeline resolver response handler if this
+    was the last AWS AppSync function) is called."
     Ending the whole pipeline instead means every later function is silently
     skipped. A real resolver that guards its first function this way then
     returns null with no error, because the function that would have set the
@@ -2020,6 +2032,9 @@ def test_appsync_js_resolver_early_return_still_runs_the_response(appsync):
     """earlyReturn in the pipeline RESOLVER's request skips the functions, and
     the resolver's own response handler still runs.
 
+def test_appsync_js_resolver_early_return_still_runs_the_response(appsync):
+    """earlyReturn in the pipeline RESOLVER's request skips the functions, and
+    the resolver's own response handler still runs.
     AWS: "the pipeline execution is skipped, and the pipeline resolver response
     handler is called immediately."
     """
@@ -2107,6 +2122,9 @@ def test_appsync_js_lambda_datasource_receives_the_payload_verbatim(appsync, lam
     """A JS resolver returning {operation: 'Invoke', payload} sends exactly that
     payload as the Lambda event.
 
+def test_appsync_js_lambda_datasource_receives_the_payload_verbatim(appsync, lam):
+    """A JS resolver returning {operation: 'Invoke', payload} sends exactly that
+    payload as the Lambda event.
     It was being wrapped in the standard resolver event instead, so a function
     expecting its own shape — say {text: [...]} — received
     {arguments: {text: [...]}, info: {...}} and returned something the resolver
