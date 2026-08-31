@@ -1967,3 +1967,73 @@ def test_kms_create_key_rsa_3072_signs(kms_client):
         Signature=signature,
         SigningAlgorithm="RSASSA_PSS_SHA_256",
     )["SignatureValid"]
+
+
+def test_kms_generate_random_returns_requested_bytes(kms_client):
+    """GenerateRandom is keyless; the response Plaintext is exactly the
+    requested number of bytes, and two calls do not repeat."""
+    first = kms_client.generate_random(NumberOfBytes=32)["Plaintext"]
+    second = kms_client.generate_random(NumberOfBytes=32)["Plaintext"]
+    assert len(first) == 32
+    assert len(second) == 32
+    assert first != second
+    assert len(kms_client.generate_random(NumberOfBytes=1)["Plaintext"]) == 1
+    assert len(kms_client.generate_random(NumberOfBytes=1024)["Plaintext"]) == 1024
+
+
+def test_kms_generate_random_validation(kms_client):
+    """An omitted or out-of-range NumberOfBytes is a ValidationException, a
+    CustomKeyStoreId a CustomKeyStoreNotFoundException — botocore validates the
+    range client-side, so the raw-request path is exercised via the wire."""
+    import requests as _requests
+
+    def _raw(payload):
+        return _requests.post(
+            ENDPOINT,
+            json=payload,
+            headers={
+                "x-amz-target": "TrentService.GenerateRandom",
+                "content-type": "application/x-amz-json-1.1",
+            },
+            timeout=10,
+        )
+
+    resp = _raw({})
+    assert resp.status_code == 400
+    assert "ValidationException" in resp.json().get("__type", "")
+    assert resp.json().get("message") == "NumberOfBytes is required."
+
+    resp = _raw({"NumberOfBytes": 0})
+    assert resp.status_code == 400
+    assert "ValidationException" in resp.json().get("__type", "")
+    assert resp.json().get("message") == (
+        "1 validation error detected: Value '0' at 'numberOfBytes' failed to "
+        "satisfy constraint: Member must have value greater than or equal to 1"
+    )
+
+    resp = _raw({"NumberOfBytes": 2000})
+    assert resp.status_code == 400
+    assert "ValidationException" in resp.json().get("__type", "")
+
+    resp = _raw({"NumberOfBytes": 16, "CustomKeyStoreId": "cks-does-not-exist"})
+    assert resp.status_code == 400
+    assert "CustomKeyStoreNotFoundException" in resp.json().get("__type", "")
+
+
+def test_kms_generate_random_refuses_a_recipient(kms_client):
+    """The Nitro-enclave Recipient parameter is refused, not silently ignored.
+
+    A caller sending Recipient expects CiphertextForRecipient and a null
+    Plaintext; MiniStack cannot encrypt to an enclave attestation key, and
+    answering Plaintext anyway is a response shape the request never gets from
+    the real service.
+    """
+    with pytest.raises(ClientError) as e:
+        kms_client.generate_random(
+            NumberOfBytes=32,
+            Recipient={
+                "KeyEncryptionAlgorithm": "RSAES_OAEP_SHA_256",
+                "AttestationDocument": b"not-a-real-attestation-document",
+            },
+        )
+    assert e.value.response["Error"]["Code"] == "UnsupportedOperationException"
