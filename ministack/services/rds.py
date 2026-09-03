@@ -3325,9 +3325,18 @@ def _cluster_endpoint_aliases(cluster):
     address. Docker's embedded DNS accepts dotted names, so the alias can be the
     real endpoint rather than something invented alongside it.
 
-    The writer endpoint only. ReaderEndpoint has to follow whichever member is
-    currently a reader, and a cluster can promote one on failover, so pinning it
-    to the writer's container would answer with the wrong database.
+    The reader name is registered alongside it, while reads cannot move off this
+    container. CreateDBCluster hands out a ``cluster-ro-`` name and a consumer
+    stores it -- Terraform reads ``reader_endpoint`` during the apply that
+    creates the cluster -- but nothing ever made that name resolve, so a client
+    configured from it fails DNS and hangs until its own timeout. Reporting is
+    unchanged: ``ReaderEndpoint`` still answers with the address
+    ``_sync_cluster_endpoints`` computes. This only makes the name that was
+    already handed out resolve to whatever currently serves reads.
+
+    With per-instance readers enabled a standby answers reads and carries the
+    name itself, and a cluster can promote one on failover, so pinning it to
+    this container would answer from the wrong database: it is left alone there.
     """
     value = cluster.get("Endpoint")
     # Two shapes in practice: a bare string when the cluster is created, and the
@@ -3341,10 +3350,19 @@ def _cluster_endpoint_aliases(cluster):
     # host-run ministack stamps into Endpoint — registering it as a network
     # alias would hijack that name inside the Docker network after a
     # host-run -> containerized restart, so it never qualifies.
+    names = []
     if (isinstance(value, str) and value and not value[0].isdigit()
             and value not in ("localhost", _MINISTACK_HOST)):
-        return [value]
-    return []
+        names.append(value)
+    if not _pg_cluster_replication_enabled(cluster):
+        reader = cluster.get("ReaderEndpoint")
+        if isinstance(reader, dict):
+            reader = reader.get("Address")
+        if (isinstance(reader, str) and reader and not reader[0].isdigit()
+                and reader not in ("localhost", _MINISTACK_HOST)
+                and reader not in names):
+            names.append(reader)
+    return names
 
 
 def _next_port():

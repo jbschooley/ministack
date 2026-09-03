@@ -13665,7 +13665,7 @@ def test_rds_modify_cluster_sets_serverlessv2_scaling_configuration(rds):
     assert slv2["MaxCapacity"] == 8.0
 
 
-def test_rds_cluster_endpoint_alias_survives_the_record_changing_shape():
+def test_rds_cluster_endpoint_alias_survives_the_record_changing_shape(monkeypatch):
     """The endpoint alias is read from both shapes the cluster record takes.
 
     A cluster carries ``Endpoint`` as a bare string when it is created and as an
@@ -13693,11 +13693,29 @@ def test_rds_cluster_endpoint_alias_survives_the_record_changing_shape():
         {"Endpoint": {"Address": "172.20.0.4"}}) == []
     assert rds_service._cluster_endpoint_aliases({}) == []
 
-    # ReaderEndpoint is deliberately not aliased: it has to follow whichever
-    # member is currently a reader, and failover moves that.
+    # The reader name is aliased too, while reads cannot move off this
+    # container: CreateDBCluster hands it out and consumers store it, so it has
+    # to resolve. What ReaderEndpoint *reports* is unchanged -- only resolution.
+    reader = "mydb.cluster-ro-abc123.us-east-2.rds.amazonaws.com"
     assert rds_service._cluster_endpoint_aliases(
-        {"Endpoint": name, "ReaderEndpoint": "ro.cluster-abc.rds.amazonaws.com"}
-    ) == [name]
+        {"Endpoint": name, "ReaderEndpoint": reader}) == [name, reader]
+    assert rds_service._cluster_endpoint_aliases(
+        {"Endpoint": name, "ReaderEndpoint": {"Address": reader}}) == [name, reader]
+    # A cluster advertising one name for both registers it once.
+    assert rds_service._cluster_endpoint_aliases(
+        {"Endpoint": name, "ReaderEndpoint": name}) == [name]
+    # An address, or the host-run name, never qualifies -- reader or writer.
+    assert rds_service._cluster_endpoint_aliases(
+        {"Endpoint": name, "ReaderEndpoint": "172.20.0.9"}) == [name]
+    assert rds_service._cluster_endpoint_aliases(
+        {"Endpoint": name, "ReaderEndpoint": "localhost"}) == [name]
+
+    # With per-instance readers on, a standby serves reads and carries the name
+    # itself; pinning it here would answer from the writer.
+    monkeypatch.setattr(rds_service, "RDS_PG_CLUSTER_REPLICATION", True)
+    assert rds_service._cluster_endpoint_aliases(
+        {"Endpoint": name, "ReaderEndpoint": reader,
+         "Engine": "aurora-postgresql"}) == [name]
 
 
 def test_rds_network_aliases_only_on_user_defined_networks():
